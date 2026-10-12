@@ -319,6 +319,8 @@ void fap_main(void)
 	irq_init();
 	log_reg("gp mask", reg_rd(FAP_REG_GP_MASK));
 
-	for (;;)
+	for (;;) {
 		main_loops++;
+		__asm__ volatile("wait");
+	}
 }

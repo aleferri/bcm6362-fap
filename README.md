@@ -153,7 +153,10 @@ The firmware now:
   `FAP_GP_MBOX_OUT` added to `gp_mask`;
 - waits for the host to take each message before writing the next one;
 - counts its main loop iterations in DSPRAM; the timer posts a heartbeat
-  only if they moved since the previous tick.
+  only if they moved since the previous tick;
+- sleeps in WAIT between interrupts. If the Count stopped in WAIT the
+  timer would never wake the core, the heartbeat would stall and the
+  watchdog would report the core as crashed.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
