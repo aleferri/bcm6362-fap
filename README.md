@@ -111,42 +111,71 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 ## Operating model
 
-When the FAP is active it is the only owner of the ENETSW iuDMA. Since a
-stuck FAP would then take the whole network down, the rest of the system
+The iuDMA channels are independent: each has its own registers, state
+RAM and descriptor ring. When active, the FAP owns the RX channel and a
+TX channel of its own, while the enetsw driver keeps its TX channel:
+
+- RX: every frame lands on the FAP. Frames of offloaded flows are
+  rewritten and sent on the FAP TX channel, all the others go to the host
+  through a queue.
+- TX: the host transmits on its own channel as today, the FAP on its
+  own, the switch takes both on the CPU port. This is the "TX splitting"
+  of the stock firmware [SDK].
+
+Splitting the work multiplies the processing capacity, not the link
+capacity: everything still crosses the CPU port of the switch and, on the
+DSL-3580L, the RGMII link to the BCM53125, at most 1 Gbit/s per
+direction.
+
+Since a stuck FAP would take the RX path down, the rest of the system
 never depends on it:
 
 1. the FAP boots with the driver and stays idle: it runs, posts its
    heartbeat and answers the mailbox, and touches nothing outside its own
    block;
-2. the system behaves as if it did not exist: the enetsw driver keeps the
-   iuDMA until the FAP is activated by hand or by a script;
+2. the system behaves as if it did not exist: the enetsw driver keeps
+   RX until the FAP is activated by hand or by a script;
 3. the heartbeat only advances if the firmware main loop does, so a core
    spinning in interrupts or stuck in a loop stops it;
 4. the host checks at low frequency the heartbeat and, while the FAP is
    active, its packet progress: if there is work pending (filled RX
-   descriptors, host packets queued for TX) and the FAP counters did not
-   move, or they diverge (packets taken in but neither transmitted nor
-   handed to the host), the host deactivates the FAP. An idle link moves
-   nothing and is fine.
+   descriptors) and the FAP counters did not move, or they diverge
+   (packets taken in but neither transmitted nor handed to the host), the
+   host deactivates the FAP. An idle link moves nothing and is fine.
 
-Deactivation, by hand or by the watchdog, gives the iuDMA back to the
-host driver, which keeps working without offload. A FAP that stalls or
-faults is also held in reset, with its log kept for inspection.
+Deactivation, by hand or by the watchdog, moves RX back to the host,
+which keeps working without offload; its TX channel was never touched.
+A FAP that stalls or faults is also held in reset, with its log kept for
+inspection.
+
+Moving RX can be done in two ways, to be chosen once the switch is
+understood:
+
+- the FAP takes over the host RX channel, which the enetsw driver stops
+  on activation and restarts on deactivation;
+- the FAP gets an RX channel of its own and the switch maps its CPU port
+  queues to it on activation and back on deactivation, if it can map
+  queues to channels: then the host never stops anything.
+
+Shared state needs coordination either way: the global controller
+enable and the channel resets belong to the whole iuDMA, so the enetsw
+driver must know about the FAP, and the interrupt of the FAP RX channel
+has to be routed to the FAP with miscFapIrqMask [SDK].
 
 ## Offload plan
 
 | Phase | Content | Exit criterion | Status |
 |---|---|---|---|
 | 0 | Loader, boot, mailbox, log, memory tests | The 4KE runs and talks to the host | done |
-| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer). Heartbeat from the main loop, host watchdog holding a stalled 4KE in reset | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | done |
-| 2 | Host–FAP transport: DQM queues in QSM with a "not empty" interrupt. Alternatively, our own rings in PSM | A ping that goes through the queues instead of the mailbox | |
-| 3 | Activation: on an activation command the enetsw driver stops its iuDMA channels and the FAP takes RX and TX, with the RX interrupts routed to the FAP; the host receives and transmits through the queues. On deactivation, or when the watchdog trips on packet progress, the host takes the channels back and the FAP returns idle. Only the test bench for phase 4, never a default | Activation and deactivation under traffic with the network still working afterwards; a firmware forced to stall or fault gives the network back to the host within one watchdog period | |
-| 4 | Flow offload, the FAP in control: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly; the rest goes to the host as in phase 3. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
+| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM, DDR and iuDMA, stack in DSPRAM, interrupts on the 4KE (mailbox and timer), WAIT. Heartbeat from the main loop, host watchdog holding a stalled 4KE in reset | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | done |
+| 2 | Host–FAP transport for received frames: a FAP to host queue of filled buffers with an interrupt, a host to FAP queue of free buffers. DQM queues in QSM, or our own rings in QSM/PSM; host access cost to QSM/PSM decides | Frames generated by the FAP received by the host as packets, buffers recycled | |
+| 3 | RX delegation: on activation RX moves to the FAP, which hands every frame to the host through the phase 2 queues; on deactivation, or when the watchdog trips on packet progress, RX moves back. Only the test bench for phase 4, never a default | Activation and deactivation under traffic with the network still working afterwards; a firmware forced to stall or fault gives RX back to the host within one watchdog period | |
+| 4 | Flow offload with TX splitting: the FAP gets its own TX channel. nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards; the host writes the flow table directly into PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits on its channel; the rest goes to the host as in phase 3. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
 
 Today the enetsw driver reclaims transmitted descriptors in its NAPI
 poll, which on the 6362 only the RX interrupt schedules, since the ENETSW
-has no TX interrupt lines. With the FAP owning TX, completions can reach
-the host through the queues.
+has no TX interrupt lines. With RX on the FAP, the host needs another
+trigger for that reclaim: the interrupt of the phase 2 queue, or a timer.
 
 ## Phase 1: characterization
 
