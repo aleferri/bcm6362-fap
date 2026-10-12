@@ -123,12 +123,6 @@ static void mbox_pong(void)
 	mbox_send(FAP_MSG_PONG, msg);
 }
 
-static void irq_mask_lines(unsigned int lines)
-{
-	write_c0(CP0_STATUS, 0, read_c0(CP0_STATUS, 0) & ~lines);
-	shared->irq_masked |= lines;
-}
-
 static void irq_timer(void)
 {
 	unsigned int compare = read_c0(CP0_COMPARE, 0);
@@ -149,33 +143,22 @@ static void irq_timer(void)
 		main_loops_seen = main_loops;
 		shared->heartbeat++;
 	}
+}
 
-	/* keeps the mailbox alive if its interrupt never shows up */
-	if (reg_rd(FAP_REG_GP_STATUS) & FAP_GP_MBOX_OUT) {
-		shared->mbox_polled++;
+static void irq_fap(void)
+{
+	if (reg_rd(FAP_REG_IRQ_4KE_STATUS) & FAP_IRQ_4KE_MBOX_OUT) {
+		shared->pings++;
 		mbox_pong();
 	}
 }
 
 void fap_irq(unsigned int cause)
 {
-	unsigned int lines = cause & read_c0(CP0_STATUS, 0) & CAUSE_IP;
-
 	if (cause & CAUSE_TI)
 		irq_timer();
-
-	if (reg_rd(FAP_REG_IRQ_4KE_STATUS) & FAP_IRQ_4KE_MBOX_OUT) {
-		shared->mbox_irq++;
-		shared->irq_lines |= lines;
-		mbox_pong();
-
-		if (reg_rd(FAP_REG_IRQ_4KE_STATUS) & FAP_IRQ_4KE_MBOX_OUT) {
-			reg_wr(FAP_REG_IRQ_4KE_MASK, 0);
-			irq_mask_lines(lines);
-		}
-	} else if (!(cause & CAUSE_TI)) {
-		irq_mask_lines(lines);
-	}
+	if (cause & read_c0(CP0_STATUS, 0) & ST0_IM_FAP)
+		irq_fap();
 }
 
 static unsigned int dspram_load_tag(unsigned int offset)
@@ -289,7 +272,7 @@ static void irq_init(void)
 	reg_wr(FAP_REG_GP_MASK, reg_rd(FAP_REG_GP_MASK) | FAP_GP_MBOX_OUT);
 	reg_wr(FAP_REG_IRQ_4KE_MASK, FAP_IRQ_4KE_MBOX_OUT);
 
-	write_c0(CP0_STATUS, 0, ST0_IM_HW | ST0_IE);
+	write_c0(CP0_STATUS, 0, ST0_IM_FAP | ST0_IM_TIMER | ST0_IE);
 }
 
 void fap_exception(unsigned int cause, unsigned int epc,

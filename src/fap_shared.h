@@ -83,11 +83,8 @@ struct fap_shared {
 	unsigned int count_res;		/* cycles per CP0 Count increment */
 	unsigned int pong_count;	/* CP0 Count when the last pong left */
 
-	unsigned int mbox_irq;		/* pings taken by the FAP interrupt */
-	unsigned int mbox_polled;	/* pings found by the timer interrupt */
+	unsigned int pings;
 	unsigned int mbox_lost;		/* messages overwritten before the ack */
-	unsigned int irq_lines;		/* Cause.IP raised with a ping pending */
-	unsigned int irq_masked;	/* Cause.IP masked as unknown or stuck */
 	unsigned int timer_lat_min;	/* CP0 Count from Compare to handler */
 	unsigned int timer_lat_max;
 

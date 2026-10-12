@@ -40,10 +40,10 @@
 #define CP0_TAGHI		$29
 
 #define ST0_IE			(1 << 0)
-#define ST0_IM_HW		0xfc00		/* IP2..IP7 */
+#define ST0_IM_FAP		(1 << 10)	/* IP2: irq_4ke_status */
+#define ST0_IM_TIMER		(1 << 15)	/* IP7: CP0 Count/Compare */
 
 #define CAUSE_TI		(1 << 30)
-#define CAUSE_IP		0xff00
 #define CAUSE_EXCCODE		0x7c
 
 #define CONFIG_K0_MASK		0x7

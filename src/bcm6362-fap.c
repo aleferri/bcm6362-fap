@@ -439,11 +439,8 @@ static int stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "heartbeat       %u\n", READ_ONCE(sh->heartbeat));
 	seq_printf(s, "timer latency   %u..%u counts\n",
 		   READ_ONCE(sh->timer_lat_min), READ_ONCE(sh->timer_lat_max));
-	seq_printf(s, "mbox            irq %u polled %u lost %u\n",
-		   READ_ONCE(sh->mbox_irq), READ_ONCE(sh->mbox_polled),
-		   READ_ONCE(sh->mbox_lost));
-	seq_printf(s, "irq lines       0x%04x masked 0x%04x\n",
-		   READ_ONCE(sh->irq_lines), READ_ONCE(sh->irq_masked));
+	seq_printf(s, "mbox            pings %u lost %u\n",
+		   READ_ONCE(sh->pings), READ_ONCE(sh->mbox_lost));
 
 	load = bench_centicycles(fap, READ_ONCE(sh->bench_alu));
 	seq_puts(s, "\ncycles per access    load   store\n");

@@ -148,13 +148,9 @@ The firmware now:
 - reads the CP0 Count resolution with `rdhwr $3`;
 - times 8192 loads and 8192 stores on one word of DSPRAM, PSM, QSM, the
   scratch control register and DDR, plus the same loop with adds only;
-- runs on interrupts: the CP0 timer every `FAP_TIMER_PERIOD` Count ticks,
-  and the mailbox through `irq_4ke_mask` bit 5 with `FAP_GP_MBOX_OUT` added
-  to `gp_mask`. Which CPU interrupt line the FAP block drives is not known,
-  so all hardware lines are enabled and the ones seen with a ping pending
-  are recorded; lines firing for no known reason are masked and recorded.
-  The timer also polls the mailbox, so pings keep working if the FAP
-  interrupt never arrives, and the counters tell the two paths apart;
+- runs on interrupts: the CP0 timer on IP7 every `FAP_TIMER_PERIOD`
+  Count ticks, and the mailbox on IP2 through `irq_4ke_mask` bit 5 with
+  `FAP_GP_MBOX_OUT` added to `gp_mask`;
 - waits for the host to take each message before writing the next one;
 - counts its main loop iterations in DSPRAM; the timer posts a heartbeat
   only if they moved since the previous tick.
@@ -194,10 +190,7 @@ What to read:
     while the main loop runs;
   - `timer latency` is the time from the Compare match to the handler, in
     Count ticks: the interrupt entry cost;
-  - `mbox irq` growing means the mailbox interrupt works and `irq lines`
-    shows its Cause.IP bit; only `polled` growing means it does not reach
-    the CPU; `lost` should stay at 0;
-  - `masked` non-zero means unexpected interrupt lines;
+  - `pings` counts the pings answered, `lost` should stay at 0;
   - the access table gives cycles per access; `alu` is the loop cost with
     an add in place of each load.
 
