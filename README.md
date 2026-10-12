@@ -231,7 +231,10 @@ cat hostbench
 
 `hostbench` times host loads and stores on the FAP scratch register, QSM,
 PSM and DDR, uncached and cached, in ns per access: it decides where the
-phase 2 queues go.
+phase 2 queues go. It times plain accesses and the MMIO accessors
+separately: on MIPS every accessor, the relaxed ones included, issues a
+sync before the access and the non relaxed reads another one after, so a
+queue touched word by word with them pays a sync per word.
 
 `iudma` should report the same `controller_cfg`, channel 0 `cfg` and
 channel 0 `ring` as the three `devmem` reads on the host. If the 4KE

@@ -493,45 +493,69 @@ DEFINE_SHOW_ATTRIBUTE(iudma);
 
 /*
  * Host access timings on one word of each target, in hundredths of a ns
- * per access. Loads add the loaded value; stores write back the value the
- * word already holds and end with a read back, so that posted writes are
- * counted.
+ * per access, both with plain loads and stores and with the MMIO
+ * accessors, which on MIPS issue a sync around every access. Loads add
+ * the loaded value; stores write back the value the word already holds
+ * and end with a sync and a read back, so that posted writes are counted.
  */
-static void host_bench(void __iomem *p, u32 *load, u32 *store)
+struct host_bench {
+	u32 load, store, readl, writel;
+};
+
+static u32 host_bench_ns(u64 t0, u64 t1)
 {
+	return div_u64((t1 - t0) * 100, FAP_HOST_BENCH_ACCESSES);
+}
+
+static void host_bench(void __iomem *p, struct host_bench *b)
+{
+	u32 *q = (u32 __force *)p;
 	unsigned long flags;
+	u64 t0, t1, t2, t3, t4;
 	u32 sum = 0, val;
-	u64 t0, t1, t2;
 	int i;
 
 	local_irq_save(flags);
+	val = READ_ONCE(*q);
 
 	t0 = ktime_get_ns();
 	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
-		sum += __raw_readl(p);
+		sum += READ_ONCE(*q);
 	t1 = ktime_get_ns();
-
-	val = __raw_readl(p);
+	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
+		WRITE_ONCE(*q, val);
+	/* drain the write buffer, so that the stores are all timed */
+	mb();
+	sum += READ_ONCE(*q);
+	t2 = ktime_get_ns();
+	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
+		sum += __raw_readl(p);
+	t3 = ktime_get_ns();
 	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
 		__raw_writel(val, p);
-	sum += __raw_readl(p);
-	t2 = ktime_get_ns();
+	/* as above */
+	mb();
+	sum += READ_ONCE(*q);
+	t4 = ktime_get_ns();
 
 	local_irq_restore(flags);
 
-	OPTIMIZER_HIDE_VAR(sum);
-	*load = div_u64((t1 - t0) * 100, FAP_HOST_BENCH_ACCESSES);
-	*store = div_u64((t2 - t1) * 100, FAP_HOST_BENCH_ACCESSES);
+	barrier_data(&sum);
+	b->load = host_bench_ns(t0, t1);
+	b->store = host_bench_ns(t1, t2);
+	b->readl = host_bench_ns(t2, t3);
+	b->writel = host_bench_ns(t3, t4);
 }
 
 static void host_bench_show(struct seq_file *s, const char *name,
 			    void __iomem *p)
 {
-	u32 load, store;
+	struct host_bench b;
 
-	host_bench(p, &load, &store);
-	seq_printf(s, "%-16s %6u.%02u %6u.%02u\n", name,
-		   load / 100, load % 100, store / 100, store % 100);
+	host_bench(p, &b);
+	seq_printf(s, "%-14s %4u.%02u %4u.%02u %4u.%02u %4u.%02u\n", name,
+		   b.load / 100, b.load % 100, b.store / 100, b.store % 100,
+		   b.readl / 100, b.readl % 100, b.writel / 100, b.writel % 100);
 }
 
 static int hostbench_show(struct seq_file *s, void *unused)
@@ -543,7 +567,7 @@ static int hostbench_show(struct seq_file *s, void *unused)
 	if (!cached)
 		return -ENOMEM;
 
-	seq_puts(s, "ns per access        load      store\n");
+	seq_puts(s, "ns per access     load   store   readl  writel\n");
 	host_bench_show(s, "regs", fap->regs + FAP_REG_SCRATCH);
 	if (fap->qsm)
 		host_bench_show(s, "qsm", fap->qsm);
