@@ -18,16 +18,31 @@ Next to every fact in this summary is its source:
 | Cache | 16 KB 4-way I-cache, 16-byte lines. No D-cache | [HW] |
 | DSPRAM | Present, 8 KB, enabled at 0x4000 (TagLo 0x4080, read back as 0x40a0) and tested. The size comes from the stock firmware, not from the hardware | [HW] |
 | Other | MIPS16e, EJTAG, COP2 interface present (what is attached to it is unknown), no FPU and no performance counters | [HW] |
-| Frequency | 200 MHz, CP0 Count incrementing every other cycle | [SDK] |
-| | The phase 0 polling loop ran 13.9 million iterations per second, so at least about 100 MHz | [HW] |
+| Frequency | 166.67 MHz, CP0 Count at 83.33 MHz (resolution 2), measured against the host clock. The SDK comments say 200 MHz | [HW] |
+| Interrupts | CP0 timer on IP7 (IntCtl.IPTI), FAP block on IP2. Entry into a C handler 54–740 cycles, including the context save | [HW] |
+
+### Access cost
+
+Cycles per access from the 4KE, with the loop overhead taken out. Loads
+are followed by an instruction using the loaded value. Every access hits
+the same word, so the DDR figure is a best case with the row already open.
+
+| Target | Load | Store |
+|---|---|---|
+| DSPRAM | 2 | 1 |
+| PSM, QSM | 7 | 4.6 |
+| FAP control registers | 6 | 6.6 |
+| DDR | 30.6 | 7.6 |
+
+Source: [HW], phase 1 benchmark. Stores go through the write buffer.
 
 ### Address map
 
 | Block | Seen by the 4KE | Seen by the host via UBUS | Size |
 |---|---|---|---|
 | FAP registers | 0xe0001000 [HW] | 0x11001000 [HW] | 4 KB, plus the DQM counters at +0x1000 [SDK] |
-| QSM | 0xe0004000 [HW] | 0x11004000 [SDK]; the stock driver uses the SMISB alias 0x14004000 [blob] | 16 KB [HW, 4KE side] |
-| PSM | 0xe0010000 [HW] | 0x11010000 [blob] | 32 KB [HW, 4KE side] |
+| QSM | 0xe0004000 [HW] | 0x11004000 [HW]; the stock driver uses the SMISB alias 0x14004000 [blob] | 16 KB [HW] |
+| PSM | 0xe0010000 [HW] | 0x11010000 [HW] | 32 KB [HW] |
 | DPE | 0xe0050000… | 0x11040000 | [SDK] |
 | DDR | Through two translators: mask, 4KE-side base, host-side base. They ignore bits 31 and 29, so kseg0 and kseg1 are aliases | — | power-of-two sized, naturally aligned block [HW] |
 
@@ -45,9 +60,9 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 | Offset | Register | Source |
 |---|---|---|
-| 0x00 / 0x04 | irq_4ke mask and status. Bit 0 timer, bit 4 MBOX_IN, bit 5 MBOX_OUT | [SDK] |
+| 0x00 / 0x04 | irq_4ke mask and status, driving IP2 [HW]. Bit 0 timer, bit 4 MBOX_IN [SDK]. Bit 5 MBOX_OUT follows gp_status bit 3 and clears with it [HW] |
 | 0x08 / 0x0c | irq_mips mask and status. Bit 4 (MBOX_IN) follows gp_status | [HW] |
-| 0x10 / 0x14 | gp mask and status. Bit 2: the 4KE wrote. Bit 3: the host wrote. Both write-one-to-clear | [HW] |
+| 0x10 / 0x14 | gp mask and status. Bit 2: the 4KE wrote. Bit 3: the host wrote. Both write-one-to-clear. The firmware sets mask bit 3 for its interrupt; whether that is needed was not tested | [HW] |
 | 0x28 | host_mbox_in, from the 4KE to the host | [HW] |
 | 0x2c | host_mbox_out, from the host to the 4KE | [HW] |
 | 0x6c–0x80 | Translators 1 and 2 | [HW] |
@@ -79,12 +94,11 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 ### Still unknown
 
-- 4KE frequency and access latencies of registers, PSM, QSM and DDR (phase 1 measures them);
-- which CPU interrupt line the FAP block drives (phase 1 records it);
 - what sits on COP2;
 - DQM semantics beyond the header structs;
-- how the 4KE reaches the ENETSW iuDMA registers and SRAM (to be derived from the stock 4KE code);
-- the QSM over UBUS from the host side, verifiable with the next flash.
+- how the 4KE reaches the ENETSW iuDMA registers and SRAM (to be derived from the stock 4KE code), and what an access costs;
+- the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
+- whether the CP0 Count keeps running while the 4KE sits in WAIT.
 
 ## Operating model
 
@@ -115,7 +129,7 @@ faults is also held in reset, with its log kept for inspection.
 | Phase | Content | Exit criterion | Status |
 |---|---|---|---|
 | 0 | Loader, boot, mailbox, log, memory tests | The 4KE runs and talks to the host | done |
-| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer). Heartbeat from the main loop, host watchdog holding a stalled 4KE in reset | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | implemented, to be run on hardware |
+| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer). Heartbeat from the main loop, host watchdog holding a stalled 4KE in reset | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | done |
 | 2 | Host–FAP transport: DQM queues in QSM with a "not empty" interrupt. Alternatively, our own rings in PSM | A ping that goes through the queues instead of the mailbox | |
 | 3 | Activation: on an activation command the enetsw driver stops its iuDMA channels and the FAP takes RX and TX, with the RX interrupts routed to the FAP; the host receives and transmits through the queues. On deactivation, or when the watchdog trips on packet progress, the host takes the channels back and the FAP returns idle. Only the test bench for phase 4, never a default | Activation and deactivation under traffic with the network still working afterwards; a firmware forced to stall or fault gives the network back to the host within one watchdog period | |
 | 4 | Flow offload, the FAP in control: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly; the rest goes to the host as in phase 3. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
@@ -191,10 +205,17 @@ What to read:
 
 At a core clock f the cycles available per packet are
 f / (T / (8 * (L + 20))) for a throughput T in bit/s and frames of L
-bytes (20 bytes of preamble and inter-frame gap). Assuming the SDK
-200 MHz, 800 Mbit/s gives about 3000 cycles per 1500 byte frame and
-about 170 per 64 byte frame. The access table says how many PSM, QSM,
-register and DDR accesses fit in there.
+bytes (20 bytes of preamble and inter-frame gap). At the measured
+166.67 MHz and 800 Mbit/s that is about 2500 cycles per 1500 byte frame
+and 140 per 64 byte frame.
+
+The budget is shared by both directions: a TCP download at 800 Mbit/s is
+about 66 kpps of data plus 33 kpps of ACKs, about 1700 cycles per packet
+on average. A forwarded packet needing some ten header loads from DDR
+(about 300 cycles), a PSM table lookup (about 150) plus descriptors and
+stores stays well under 1000 cycles, so 700–800 Mbit/s with full size
+frames looks reachable, while small frames at line rate do not. The
+iuDMA access cost, still to be measured, is the main open term.
 
 ## Upstream
 
