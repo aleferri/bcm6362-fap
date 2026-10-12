@@ -582,6 +582,46 @@ static ssize_t ebase_write(struct file *file, const char __user *buf,
 }
 DEFINE_SHOW_STORE_ATTRIBUTE(ebase);
 
+static int peek_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+
+	seq_printf(s, "0x%08x: 0x%08x, %u counts\n",
+		   READ_ONCE(fap->shared->peek_addr),
+		   READ_ONCE(fap->shared->peek_val),
+		   READ_ONCE(fap->shared->peek_ticks));
+
+	return 0;
+}
+
+/* a 4KE virtual address for the 4KE to load once */
+static ssize_t peek_write(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	struct bcm6362_fap *fap = file_inode(file)->i_private;
+	u32 addr;
+	int ret;
+
+	ret = kstrtou32_from_user(buf, count, 0, &addr);
+	if (ret)
+		return ret;
+	if (!IS_ALIGNED(addr, 4))
+		return -EINVAL;
+
+	guard(mutex)(&fap->lock);
+
+	WRITE_ONCE(fap->shared->peek_addr, addr);
+	WRITE_ONCE(fap->shared->peek_val, 0);
+	WRITE_ONCE(fap->shared->peek_ticks, 0);
+	/* the address is in memory before the command reaches the 4KE */
+	wmb();
+	ret = bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_PEEK, ++fap->ping_seq),
+			       NULL, NULL);
+
+	return ret ?: count;
+}
+DEFINE_SHOW_STORE_ATTRIBUTE(peek);
+
 /*
  * Host access timings on one word of each target, in hundredths of a ns
  * per access, both with plain loads and stores and with the MMIO
@@ -788,6 +828,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
 	debugfs_create_file("ddr", 0400, fap->debugfs, fap, &ddr_fops);
 	debugfs_create_file("ebase", 0600, fap->debugfs, fap, &ebase_fops);
+	debugfs_create_file("peek", 0600, fap->debugfs, fap, &peek_fops);
 	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
 			    &hostbench_fops);
 	if (fap->qsm)

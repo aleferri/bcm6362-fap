@@ -342,6 +342,18 @@ static void ebase_move(void)
 	log_reg("ebase", shared->ebase);
 }
 
+/* one load only: the address may be a register with read side effects */
+static void peek(void)
+{
+	volatile unsigned int *p = (volatile unsigned int *)shared->peek_addr;
+	unsigned int start, val;
+
+	start = read_c0(CP0_COUNT, 0);
+	val = *p;
+	shared->peek_ticks = read_c0(CP0_COUNT, 0) - start;
+	shared->peek_val = val;
+}
+
 static void run_command(unsigned int cmd)
 {
 	switch (FAP_MSG_TYPE(cmd)) {
@@ -353,6 +365,9 @@ static void run_command(unsigned int cmd)
 		break;
 	case FAP_CMD_MOVE_EBASE:
 		ebase_move();
+		break;
+	case FAP_CMD_PEEK:
+		peek();
 		break;
 	}
 

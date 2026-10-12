@@ -56,6 +56,7 @@
 #define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
 #define FAP_CMD_PROBE_DDR	2	/* value: host address of the block >> 16 */
 #define FAP_CMD_MOVE_EBASE	3	/* fills fap_shared.ebase */
+#define FAP_CMD_PEEK		4	/* reads the word at fap_shared.peek_addr */
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -128,6 +129,10 @@ struct fap_shared {
 	unsigned int ddr_direct_load;	/* benchmark ticks */
 
 	unsigned int ebase;		/* read back after FAP_CMD_MOVE_EBASE */
+
+	unsigned int peek_addr;		/* 4KE virtual address, from the host */
+	unsigned int peek_val;
+	unsigned int peek_ticks;	/* CP0 Count ticks around the load */
 
 	char log[FAP_LOG_SIZE];
 };

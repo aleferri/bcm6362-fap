@@ -213,7 +213,9 @@ The firmware now:
 - on another host command, reads its own shared area at the host physical
   address of the block, outside the translator windows, and times it;
 - on a third one, moves EBase onto the block through the boot window, so
-  that the low translator at 0 is only needed until then.
+  that the low translator at 0 is only needed until then;
+- on a fourth one, loads once from any 4KE virtual address the host
+  gives, to see what the 4KE reaches without a new firmware.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
@@ -281,6 +283,13 @@ What to read:
 - `ddr`: the magic read back means the 4KE reaches any DDR address
   directly. Like `iudma`, a wrong guess shows up as an exception or a
   watchdog stop, so run it last.
+- `peek`: write a 4KE virtual address, read back the word and the
+  CP0 Count ticks the load took. Only one load is done, since registers
+  may have read side effects, but an address nothing answers on can
+  still hang the bus. With the Fixed Mapping MMU, kseg0/kseg1 reach
+  physical addresses below 512 MB and kuseg maps virtual v to physical
+  v + 0x40000000, uncached here (Config.KU = 2): the PCIe window at
+  physical 0xa0000000 is at virtual 0x60000000 [ded.].
 - `ebase`: after `move` it should read 0x9fc00000; heartbeat and pings
   growing afterwards mean the interrupts take the new vector. `park`
   moves the low translator away from 0 (no enable bit is known, so it is
