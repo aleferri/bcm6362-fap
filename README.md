@@ -92,3 +92,11 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 | 2 | Host–FAP transport: DQM queues in QSM with a "not empty" interrupt. Alternatively, our own rings in PSM | A ping that goes through the queues instead of the mailbox | |
 | 3 | Passthrough: the FAP takes the ENETSW iuDMA RX and TX channels, RX routed to the FAP, the host receives and transmits through the queues | The router works entirely through the FAP. TX completions with interrupts, so the timer is no longer needed | |
 | 4 | Flow offload: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
+
+## Device tree examples
+
+`dts/` holds the device tree the loader was developed on: the BCM6362 SoC
+include with the `brcm,bcm6362-fap` node and the D-Link DSL-3580L board.
+They build in the OpenWrt bmips target; besides the FAP node, the SoC include
+carries a `wlan` bus node and different PCIe ranges compared to the OpenWrt
+one, and the board relies on OpenWrt specific bindings (bcma fallback SPROM).

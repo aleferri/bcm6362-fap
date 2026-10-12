@@ -1,0 +1,562 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "bcm6362.dtsi"
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "D-Link DSL-3580L";
+	compatible = "dlink,dsl-3580l", "brcm,bcm6362";
+
+	aliases {
+		led-boot = &led_power_green;
+		led-failsafe = &led_power_red;
+		led-running = &led_power_green;
+		led-upgrade = &led_power_green;
+	};
+
+	/* 64 MB DDR */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x04000000>;
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		/*
+		 * The four front-panel buttons of the DSL-3580L are wired to
+		 * the four GPIO pads that the SoC also exposes as the
+		 * ext_irq0..3 alternate function inputs of the external
+		 * interrupt controller (brcm,bcm6345-ext-intc).
+		 */
+
+		reset {
+			label = "reset";
+			gpios = <&gpio 24 GPIO_ACTIVE_LOW>;
+			interrupt-parent = <&ext_intc>;
+			interrupts = <0 IRQ_TYPE_EDGE_BOTH>;
+			linux,code = <KEY_RESTART>;
+			debounce-interval = <60>;
+		};
+
+		wps {
+			label = "wps";
+			gpios = <&gpio 25 GPIO_ACTIVE_LOW>;
+			interrupt-parent = <&ext_intc>;
+			interrupts = <1 IRQ_TYPE_EDGE_BOTH>;
+			linux,code = <KEY_WPS_BUTTON>;
+			debounce-interval = <60>;
+		};
+
+		wlan_5g {
+			label = "wlan_5g";
+			gpios = <&gpio 26 GPIO_ACTIVE_LOW>;
+			interrupt-parent = <&ext_intc>;
+			interrupts = <2 IRQ_TYPE_EDGE_BOTH>;
+			linux,code = <KEY_RFKILL>;
+			debounce-interval = <60>;
+		};
+
+		wlan_2g {
+			label = "wlan_2g";
+			gpios = <&gpio 27 GPIO_ACTIVE_LOW>;
+			interrupt-parent = <&ext_intc>;
+			interrupts = <3 IRQ_TYPE_EDGE_BOTH>;
+			linux,code = <KEY_WLAN>;
+			debounce-interval = <60>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/*
+		 * The stock CFE muxes GPIO 0 to the "usb_device_led"
+		 * hardware function of the SoC (see BP_GPIO_FUNC in the
+		 * boardparms). Here it is a plain GPIO: the hardware
+		 * auto-blink is lost, but OpenWrt can use the usbport
+		 * trigger.
+		 */
+		led-0 {
+			function = LED_FUNCTION_USB;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 0 GPIO_ACTIVE_LOW>;
+			trigger-sources = <&ehci_port1>, <&ohci_port1>;
+			linux,default-trigger = "usbport";
+		};
+
+		led-1 {
+			function = LED_FUNCTION_WPS;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		led_power_green: led-12 {
+			function = LED_FUNCTION_POWER;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+		};
+
+		led_power_red: led-13 {
+			function = LED_FUNCTION_POWER;
+			color = <LED_COLOR_ID_RED>;
+			gpios = <&gpio 13 GPIO_ACTIVE_LOW>;
+			panic-indicator;
+		};
+
+		led-14 {
+			function = "dsl";
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 14 GPIO_ACTIVE_LOW>;
+		};
+
+		led-16 {
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_RED>;
+			gpios = <&gpio 16 GPIO_ACTIVE_LOW>;
+		};
+
+		led-17 {
+			function = LED_FUNCTION_WAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 17 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Fallback SPROM for the 2.4 GHz radio integrated in the BCM6362
+	 * (chip 14e4:435f). It starts from the canonical blob
+	 * `brcm/bcm6362-sprom.bin` provided by the `broadcom-6362-sprom`
+	 * package (openwrt/broadcom-sprom repository) and applies the
+	 * board-specific fixups through brcm,sprom-fixups.
+	 *
+	 * The integrated radio is not on PCIe: it sits on the bcma
+	 * AXI/OCP backplane of the SoC, exposed by the bcm6362-wlan-shim
+	 * driver (see the &wlan node in bcm6362.dtsi). The SPROM is
+	 * matched by phandle (bcma-bus = <&wlan>), not by
+	 * pci-bus/pci-dev. See the SoC extension in
+	 * target/linux/generic/files/drivers/bcma/fallback-sprom.c.
+	 *
+	 * Applied fixups (38 words, obtained with diff_sprom.py by
+	 * comparing the `wl srdump` dump of the DSL-3580L with the
+	 * canonical blob):
+	 *
+	 *  - 0x30 (dev_id): the canonical blob has 0x4354 but the OEM
+	 *    stock firmware presents device id 0x435f to the wireless
+	 *    stack; b43 knows 0x435f (BCM6362) in main.c:5328. On the
+	 *    old fake-PCI path the synthetic config space hard-coded
+	 *    0x435f and b43 read it from there without going through
+	 *    the SPROM; on bcma host-soc b43 reads bus_sprom->dev_id,
+	 *    so it has to be realigned with a fixup.
+	 *  - 0x60..0x7e: PA calibration of chains 0/1 for the 2.4 and
+	 *    5 GHz bands (this chip has a dual-band PHY even though the
+	 *    DSL-3580L only uses 2.4 GHz; the coefficients are those of
+	 *    the board silicon).
+	 *  - 0xa0..0xb0: MCS/CCK/OFDM power offsets per modulation.
+	 */
+	bcm6362-sprom {
+		compatible = "brcm,bcma-sprom";
+
+		bcma-bus = <&wlan>;
+
+		nvmem-cells = <&macaddr_cfe_6a0 1>;
+		nvmem-cell-names = "mac-address";
+
+		brcm,sprom = "brcm/bcm6362-sprom.bin";
+		brcm,sprom-fixups =
+			/* dev_id override */
+			<0x30 0x435f>,
+			/* PA chains 0/1, 2.4 GHz band */
+			<0x60 0x204a>, <0x61 0xff71>, <0x62 0x1740>, <0x63 0xfb17>,
+			<0x66 0xfe35>, <0x67 0x10cf>, <0x68 0xfb89>,
+			<0x69 0xfeac>, <0x6a 0x12dd>, <0x6b 0xfb7f>,
+			<0x6c 0xfe4a>, <0x6d 0x10fe>, <0x6e 0xfb95>,
+			/* PA chains 0/1, 5 GHz band (dual-band PHY) */
+			<0x70 0x204a>, <0x71 0xff81>, <0x72 0x1784>, <0x73 0xfb1b>,
+			<0x76 0xfedc>, <0x77 0x1246>, <0x78 0xfbc4>,
+			<0x79 0xff44>, <0x7a 0x135b>, <0x7b 0xfbfd>,
+			<0x7c 0xfebb>, <0x7d 0x127b>, <0x7e 0xfba3>,
+			/* power offset MCS/CCK/OFDM */
+			<0xa0 0x0000>, <0xa1 0x4444>, <0xa2 0x4444>,
+			<0xa9 0x6666>, <0xaa 0x6666>, <0xab 0x6666>,
+			<0xac 0x6666>, <0xad 0x6666>, <0xae 0x6666>,
+			<0xaf 0x6666>, <0xb0 0x6666>;
+	};
+
+	/*
+	 * Fallback SPROM for the 5 GHz BCM4352 radio (chip 14e4:43b3)
+	 * on PCIe.
+	 *
+	 * The BCM4352 is in practice a BCM4360 with two of the four RF
+	 * chains disabled (2x2 instead of 3x3/4x4) for yield binning:
+	 * same die, same PHY, same OTP layout and therefore the same
+	 * SROM rev 11 structure. The proprietary `wl` driver does not
+	 * ship a dedicated fallback for the 4352 for this very reason:
+	 * it uses the 4360 template. The same strategy is used here:
+	 * the canonical blob `brcm/bcm4360-sprom.bin` from the
+	 * `broadcom-4360-sprom` package plus 35 board-specific
+	 * brcm,sprom-fixups.
+	 *
+	 * PCI topology under mainline OpenWrt: the BCM4352 is the only
+	 * device on PCIe (pcie-bcm6328 controller); the integrated radio
+	 * is NOT enumerated as PCI but as a bcma device on the SoC
+	 * backplane (see bcm6362-sprom above).
+	 *
+	 *   bus 0:00.0  [14e4:6362]  PCIe Root Port (pcie-bcm6328)
+	 *   bus 1:00.0  [14e4:43b3]  BCM4352 (5 GHz)              <- this node
+	 *
+	 * Applied fixups (35 words, obtained with diff_sprom.py by
+	 * comparing the 4352 dump of the DSL-3580L with the canonical
+	 * bcm4360-sprom.bin blob):
+	 *
+	 *  - 0x02: board revision.
+	 *  - 0x30: dev_id 0x43a2 (4360) -> 0x43b3 (4352).
+	 *  - 0x48..0x4a: board flags / option flags.
+	 *  - 0x50, 0x54: chain mask / antenna avail: this is where the
+	 *    two extra chains of the 4360 are disabled (the 2x2 vs
+	 *    3x3/4x4 difference mentioned above).
+	 *  - 0x68..0x6a: power info of cores 2/3 cleared (disabled
+	 *    chains).
+	 *  - 0x74..0x93: PA calibration of chains 0/1 for the 5G L/H
+	 *    bands, board-specific.
+	 *  - 0xe9: last word = CRC + sromrev; rev 0x0b matches, and the
+	 *    CRC is not checked by the fallback-sprom path anyway (see
+	 *    sprom_extract() in
+	 *    target/linux/generic/files/drivers/bcma/fallback-sprom.c).
+	 *
+	 * Kernel dependency: the SROM rev 11 patch (the
+	 * `bcma_sprom_extract_r11` extractor plus the rev-11-only fields
+	 * added to `struct ssb_sprom`) must be applied to the OpenWrt
+	 * kernel. See target/linux/bmips/patches-6.12/
+	 * 801-ssb-bcma-firmware-SROM-revision-11-support.patch.
+	 */
+	bcm4352-sprom {
+		compatible = "brcm,bcma-sprom";
+
+		pci-bus = <1>;
+		pci-dev = <0>;
+
+		nvmem-cells = <&macaddr_cfe_6a0 2>;
+		nvmem-cell-names = "mac-address";
+
+		brcm,sprom = "brcm/bcm4360-sprom.bin";
+		brcm,sprom-fixups =
+			<0x02 0x0668>,
+			/* dev_id 4360 -> 4352 */
+			<0x30 0x43b3>,
+			/* board flags */
+			<0x48 0x0090>, <0x49 0x4c0d>, <0x4a 0xdb00>,
+			/* chain mask 4x4 -> 2x2 + antenna avail */
+			<0x50 0x0300>, <0x54 0x0033>,
+			/* power info core 2/3 disabled */
+			<0x68 0x0000>, <0x69 0x0000>, <0x6a 0x0000>,
+			/* PA chains 0/1, 5G L band */
+			<0x74 0xff4d>, <0x75 0x1690>, <0x76 0xfd24>,
+			<0x77 0xff59>, <0x78 0x1710>, <0x79 0xfd28>,
+			<0x7a 0xff52>, <0x7b 0x16fd>, <0x7c 0xfd27>,
+			<0x7d 0xff55>, <0x7e 0x1711>, <0x7f 0xfd20>,
+			/* PA chains 0/1, 5G H band */
+			<0x88 0xff3f>, <0x89 0x1607>, <0x8a 0xfd1f>,
+			<0x8b 0xff42>, <0x8c 0x1690>, <0x8d 0xfd21>,
+			<0x8e 0xff55>, <0x8f 0x1772>, <0x90 0xfd1e>,
+			<0x91 0xff5d>, <0x92 0x178d>, <0x93 0xfd1e>,
+			/* sromrev word (the CRC differs but the
+			 * fallback-sprom path does not check it; the low
+			 * byte 0x0b == rev 11 matches the template) */
+			<0xe9 0x2f0b>;
+	};
+};
+
+&ehci {
+	status = "okay";
+
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	ehci_port1: port@1 {
+		reg = <1>;
+		#trigger-source-cells = <0>;
+	};
+};
+
+&ethernet {
+	status = "okay";
+
+	nvmem-cells = <&macaddr_cfe_6a0 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+/*
+ * lsspi CS=2 (boardparms: BP_OVERLAY_SPI_SSB2_EXT_CS + BP_ENET_CONFIG_SPI_SSB_2).
+ *
+ * labels for boardparms:
+ *   port 0  -> eth0  -> WAN
+ *   port 1  -> eth4  -> LAN4
+ *   port 2  -> eth3  -> LAN3
+ *   port 3  -> eth2  -> LAN2
+ *   port 4  -> eth1  -> LAN1
+ */
+&lsspi {
+	status = "okay";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_spi_cs2>;
+
+	switch@2 {
+		compatible = "brcm,bcm53125";
+		reg = <2>;
+		spi-max-frequency = <781000>;
+
+		dsa,member = <1 0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				label = "wan";
+			};
+
+			port@1 {
+				reg = <1>;
+				label = "lan4";
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "lan3";
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan2";
+			};
+
+			port@4 {
+				reg = <4>;
+				label = "lan1";
+			};
+
+			port@8 {
+				reg = <8>;
+
+				phy-mode = "rgmii-id";
+				ethernet = <&switch0port4>;
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * Flash SPI-NOR MX25L128 16 MB single-bank. No dual boot
+ */
+&hsspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <16666667>;
+		spi-tx-bus-width = <2>;
+		spi-rx-bus-width = <2>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				reg = <0x000000 0x010000>;
+				label = "cfe";
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					/*
+					 * Offset MAC base 0x6a0 is default
+					 * in Broadcom CFE
+					 *
+					 *   base + 0  ->  D8:FE:E3:E2:A1:3C
+					 *                 LAN/bridge (bcmsw, br0,
+					 *                 eth1..eth4 on the switch side)
+					 *   base + 1  ->  D8:FE:E3:E2:A1:3D
+					 *                 wl0 (2.4 GHz N-PHY)
+					 *   base + 2  ->  D8:FE:E3:E2:A1:3E
+					 *                 wl1 (5 GHz AC-PHY)
+					 *   base + 3  ->  D8:FE:E3:E2:A1:3F
+					 *                 WAN dedicato (eth0)
+					 */
+					macaddr_cfe_6a0: macaddr@6a0 {
+						compatible = "mac-base";
+						reg = <0x6a0 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+
+			/*
+			 * 7.5 MB rootfs + 1.4 MB kernel,
+			 * rootfs first in the original firmware.
+			 */
+			partition@10000 {
+				compatible = "brcm,bcm963xx-imagetag";
+				reg = <0x010000 0x8b0000>;
+				label = "firmware";
+			};
+
+			/*
+			 * psi_marker: 0x8c0000 - 0x8d0000 (64 KiB).
+			 * 13 byte filled near the start
+			 * (35 ea 91 b4 92 23 be 73 98 e4 bd 5a 9a),
+			 * followed by erased blocks
+			 * Read-only just because.
+			 */
+			partition@8c0000 {
+				reg = <0x8c0000 0x010000>;
+				label = "psi_marker";
+				read-only;
+			};
+
+			/*
+			 * scratch: 0x8e0000 - 0xff0000.
+			 * Erased blocks (0xff) in stock flash.
+			 */
+			partition@8e0000 {
+				reg = <0x8e0000 0x710000>;
+				label = "scratch";
+			};
+			/*
+			 * nvram_pad: 0xff0000 - 0xff8000 (32 KiB).
+			 * Erased sectors right before the Broadcom NVRAM.
+			 * Probably padding left by the factory flashing
+			 * tool to align the NVRAM to a block boundary.
+			 * Read-only to be conservative: it is unknown
+			 * whether the OEM firmware uses it as scratch
+			 * space across reboots.
+			 */
+			partition@ff0000 {
+				reg = <0xff0000 0x008000>;
+				label = "nvram_pad";
+				read-only;
+			};
+
+			/*
+			 * nvram: 0xff8000 - 0x1000000 (32 KiB).
+			 * Broadcom PSI NVRAM (Persistent Storage Image),
+			 * magic "gOGoBrCm" + "BLP0" header. It holds the
+			 * LZW-compressed OEM user configuration
+			 * (snmp_state, tr69c_acsState, etc.) with a CRC32.
+			 * It is independent of the NVRAM_DATA struct
+			 * embedded in CFE at offset 0x580 (where the MAC
+			 * comes from): this one is the runtime user
+			 * configuration, the one in CFE is set at the
+			 * factory.
+			 *
+			 * Read-only: altering it does not brick the device,
+			 * but it confuses the stock firmware if one ever
+			 * goes back to it.
+			 */
+			partition@ff8000 {
+				reg = <0xff8000 0x008000>;
+				label = "nvram";
+				read-only;
+			};
+		};
+	};
+};
+
+/*
+ * Cascaded DSA. On the BCM6362 the RGMII output path goes through
+ * port@4 of the internal switch (RoboSwitch at 0x10e00000), as
+ * confirmed by the Broadcom OEM boardparms for "DSL-3580":
+ *
+ *     {bp_ulPortMap,  .u.ul = 0x10},                   // port@4 only
+ *     {bp_ulPhyId4,   .u.ul = RGMII_DIRECT|EXTSW_CONNECTED},
+ *
+ * Layout:
+ *   PC -- LAN N -- [external BCM53125] -- port@8 RGMII --
+ *   port@4 RGMII -- [internal &switch0] -- port@8 internal --
+ *   [&ethernet GMAC] -- eth0
+ *
+ * Two DSA trees with a single conduit (eth0): tree 0 = internal
+ * switch, tree 1 = external 53125 anchored to &switch0port4. Same
+ * layout as the HG253S-V2 in mainline OpenWrt, which shares the SoC.
+ *
+ * History of the previous attempts on this block:
+ *
+ * 1) &switch0 enabled + 53125 anchored to &ethernet:
+ *    sysfs: cannot create duplicate filename '.../eth0/dsa'
+ *    b53-switch 10e00000.switch: probe ... failed with error -17
+ *    Dangling notifiers after the failed rollback of
+ *    dsa_register_switch -> kernel panic ("Reserved instruction",
+ *    PC in the heap) at the first netdev event.
+ *
+ * 2) &switch0 status="disabled":
+ *    No panic, but eth0 rx_packets stuck at 0 even with the PHYs
+ *    linked on the LAN ports: the RGMII path goes through a
+ *    switch that is off, so frames never reach the GMAC.
+ */
+&switch0 {
+	dsa,member = <0 0>;
+
+	ports {
+		switch0port4: port@4 {
+			reg = <4>;
+			label = "extsw";
+
+			phy-mode = "rgmii-id";
+
+			fixed-link {
+				speed = <1000>;
+				full-duplex;
+			};
+		};
+	};
+};
+
+&ohci {
+	status = "okay";
+
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	ohci_port1: port@1 {
+		reg = <1>;
+		#trigger-source-cells = <0>;
+	};
+};
+
+&pcie {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&usbh {
+	status = "okay";
+};
+
+/*
+ * Integrated 2.4 GHz radio of the BCM6362 (14e4:435f).
+ *
+ * Exposed by bcm6362-wlan-shim on the bcma SoC backplane, NOT
+ * through PCI. The SPROM is provided by bcm6362-sprom above,
+ * matched by phandle (bcma-bus = <&wlan>).
+ */
+&wlan {
+	status = "okay";
+};
