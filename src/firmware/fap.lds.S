@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include "fap_shared.h"
+#include "fap4ke.h"
 
 /*
  * The memory block is seen by the 4KE at FAP_4KE_BOOT_BASE and the image
  * runs from its kseg0 alias. The core has no D-cache, so data in kseg0 is
  * not cached either.
  */
-#define KSEG0(x)	(0x80000000 + (x))
-
-#define FAP_STACK_SIZE	0x800
 
 OUTPUT_ARCH(mips)
 ENTRY(_reset)
+
+_stack_top = KSEG0(DSPRAM_BASE + DSPRAM_SIZE);
+_stack_bottom = _stack_top - FAP_STACK_SIZE;
 
 SECTIONS
 {
@@ -43,13 +44,7 @@ SECTIONS
 		_bss_end = .;
 	}
 
-	.stack (NOLOAD) : {
-		. = ALIGN(8);
-		. += FAP_STACK_SIZE;
-		_stack_top = .;
-	}
-
-	ASSERT(_stack_top <= KSEG0(FAP_4KE_BOOT_BASE + FAP_SHARED_OFFSET),
+	ASSERT(_bss_end <= KSEG0(FAP_4KE_BOOT_BASE + FAP_SHARED_OFFSET),
 	       "firmware overlaps the shared area")
 
 	/DISCARD/ : {

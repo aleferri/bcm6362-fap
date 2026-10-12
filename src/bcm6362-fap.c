@@ -8,25 +8,27 @@
  */
 
 #include <linux/clk.h>
+#include <linux/completion.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/seq_file.h>
 
 #include "fap_shared.h"
 
-#define FAP_REG_IRQ_4KE_MASK	0x00
-#define FAP_REG_IRQ_4KE_STATUS	0x04
 #define FAP_REG_IRQ_MIPS_MASK	0x08
 #define FAP_REG_IRQ_MIPS_STATUS	0x0c
 #define  FAP_IRQ_MIPS_MBOX_IN	BIT(4)
-#define FAP_REG_GP_MASK		0x10
 
 /* address translators: mask, 4KE base and host base registers in a row */
 #define FAP_REG_ADDR1		0x6c
@@ -40,6 +42,9 @@
 #define FAP_REG_SOFT_RESETS	0x8c
 #define  FAP_SOFT_RESET_4KE	BIT(0)
 #define FAP_REG_CORE_STATUS	0x94
+
+#define FAP_PING_TIMEOUT_MS	100
+#define FAP_CLOCK_SAMPLE_MS	1000
 
 static char *firmware = "bcm6362-fap.bin";
 module_param(firmware, charp, 0444);
@@ -57,6 +62,13 @@ struct bcm6362_fap {
 
 	u32 mbox_last;
 	unsigned int mbox_count;
+
+	/* serializes pings */
+	struct mutex lock;
+	u16 ping_seq;
+	struct completion pong;
+	u32 pong_msg;
+	ktime_t pong_time;
 
 	struct dentry *debugfs;
 };
@@ -122,6 +134,11 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 	fap->mbox_count++;
 
 	switch (FAP_MSG_TYPE(msg)) {
+	case FAP_MSG_PONG:
+		fap->pong_time = ktime_get();
+		fap->pong_msg = msg;
+		complete(&fap->pong);
+		break;
 	case FAP_MSG_READY:
 		dev_info(fap->dev, "4KE ready, dspram %s, psm %s, qsm %s\n",
 			 msg & FAP_READY_DSPRAM ? "ok" : "failed",
@@ -138,6 +155,33 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 	}
 
 	return IRQ_HANDLED;
+}
+
+/* the 4KE answers with the low half of val and the CP0 Count it sent at */
+static int bcm6362_fap_ping(struct bcm6362_fap *fap, u32 val,
+			    ktime_t *time, u32 *count)
+{
+	lockdep_assert_held(&fap->lock);
+
+	reinit_completion(&fap->pong);
+	fap_wr(fap, val, FAP_REG_MBOX_OUT);
+
+	if (!wait_for_completion_timeout(&fap->pong,
+					 msecs_to_jiffies(FAP_PING_TIMEOUT_MS)))
+		return -ETIMEDOUT;
+
+	if (FAP_MSG_VALUE(fap->pong_msg) != FAP_MSG_VALUE(val))
+		return -EIO;
+
+	if (time)
+		*time = fap->pong_time;
+	if (count) {
+		/* pairs with the sync the firmware issues before the pong */
+		rmb();
+		*count = READ_ONCE(fap->shared->pong_count);
+	}
+
+	return 0;
 }
 
 static int regs_show(struct seq_file *s, void *unused)
@@ -255,11 +299,88 @@ static ssize_t mbox_write(struct file *file, const char __user *buf,
 	if (ret)
 		return ret;
 
-	fap_wr(fap, val, FAP_REG_MBOX_OUT);
+	mutex_lock(&fap->lock);
+	ret = bcm6362_fap_ping(fap, val, NULL, NULL);
+	mutex_unlock(&fap->lock);
 
-	return count;
+	return ret ?: count;
 }
 DEFINE_SHOW_STORE_ATTRIBUTE(mbox);
+
+/* CP0 Count rate, against the host clock across two pings */
+static int clock_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+	ktime_t t0, t1;
+	u32 c0, c1;
+	u64 hz;
+	int ret;
+
+	mutex_lock(&fap->lock);
+	ret = bcm6362_fap_ping(fap, ++fap->ping_seq, &t0, &c0);
+	if (!ret) {
+		msleep(FAP_CLOCK_SAMPLE_MS);
+		ret = bcm6362_fap_ping(fap, ++fap->ping_seq, &t1, &c1);
+	}
+	mutex_unlock(&fap->lock);
+	if (ret)
+		return ret;
+
+	hz = div64_u64((u64)(c1 - c0) * NSEC_PER_SEC,
+		       ktime_to_ns(ktime_sub(t1, t0)));
+
+	seq_printf(s, "count %llu Hz, core %llu Hz\n", hz,
+		   hz * READ_ONCE(fap->shared->count_res));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(clock);
+
+/* hundredths of a core cycle per access */
+static u32 bench_centicycles(struct bcm6362_fap *fap, u32 ticks)
+{
+	u64 cycles = (u64)ticks * READ_ONCE(fap->shared->count_res) * 100;
+
+	return div_u64(cycles, FAP_BENCH_ITERS * FAP_BENCH_UNROLL);
+}
+
+static int stats_show(struct seq_file *s, void *unused)
+{
+	static const char *const names[FAP_BENCH_NR] = {
+		[FAP_BENCH_DSPRAM] = "dspram",
+		[FAP_BENCH_PSM] = "psm",
+		[FAP_BENCH_QSM] = "qsm",
+		[FAP_BENCH_REGS] = "regs",
+		[FAP_BENCH_DDR] = "ddr",
+	};
+	struct bcm6362_fap *fap = s->private;
+	struct fap_shared *sh = fap->shared;
+	u32 load, store;
+	int i;
+
+	seq_printf(s, "count_res       %u\n", READ_ONCE(sh->count_res));
+	seq_printf(s, "heartbeat       %u\n", READ_ONCE(sh->heartbeat));
+	seq_printf(s, "timer latency   %u..%u counts\n",
+		   READ_ONCE(sh->timer_lat_min), READ_ONCE(sh->timer_lat_max));
+	seq_printf(s, "mbox            irq %u polled %u lost %u\n",
+		   READ_ONCE(sh->mbox_irq), READ_ONCE(sh->mbox_polled),
+		   READ_ONCE(sh->mbox_lost));
+	seq_printf(s, "irq lines       0x%04x masked 0x%04x\n",
+		   READ_ONCE(sh->irq_lines), READ_ONCE(sh->irq_masked));
+
+	load = bench_centicycles(fap, READ_ONCE(sh->bench_alu));
+	seq_puts(s, "\ncycles per access    load   store\n");
+	seq_printf(s, "%-16s %4u.%02u\n", "alu", load / 100, load % 100);
+	for (i = 0; i < FAP_BENCH_NR; i++) {
+		load = bench_centicycles(fap, READ_ONCE(sh->bench[i].load));
+		store = bench_centicycles(fap, READ_ONCE(sh->bench[i].store));
+		seq_printf(s, "%-16s %4u.%02u %4u.%02u\n", names[i],
+			   load / 100, load % 100, store / 100, store % 100);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(stats);
 
 static void bcm6362_fap_debugfs_remove(void *data)
 {
@@ -300,6 +421,11 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	if (!fap)
 		return -ENOMEM;
 	fap->dev = dev;
+	init_completion(&fap->pong);
+
+	ret = devm_mutex_init(dev, &fap->lock);
+	if (ret)
+		return ret;
 
 	fap->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(fap->regs))
@@ -362,6 +488,8 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("regs", 0400, fap->debugfs, fap, &regs_fops);
 	debugfs_create_file("log", 0400, fap->debugfs, fap, &log_fops);
 	debugfs_create_file("mbox", 0600, fap->debugfs, fap, &mbox_fops);
+	debugfs_create_file("clock", 0400, fap->debugfs, fap, &clock_fops);
+	debugfs_create_file("stats", 0400, fap->debugfs, fap, &stats_fops);
 	if (fap->qsm)
 		debugfs_create_file("qsm", 0400, fap->debugfs, fap, &qsm_fops);
 	if (fap->psm)

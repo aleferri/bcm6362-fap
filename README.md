@@ -18,7 +18,8 @@ Next to every fact in this summary is its source:
 | Cache | 16 KB 4-way I-cache, 16-byte lines. No D-cache | [HW] |
 | DSPRAM | Present, 8 KB, enabled at 0x4000 (TagLo 0x4080, read back as 0x40a0) and tested. The size comes from the stock firmware, not from the hardware | [HW] |
 | Other | MIPS16e, EJTAG, COP2 interface present (what is attached to it is unknown), no FPU and no performance counters | [HW] |
-| Frequency | Unknown. The polling loop runs 13.9 million iterations per second, so at least about 100 MHz | [HW] |
+| Frequency | 200 MHz, CP0 Count incrementing every other cycle | [SDK] |
+| | The phase 0 polling loop ran 13.9 million iterations per second, so at least about 100 MHz | [HW] |
 
 ### Address map
 
@@ -44,12 +45,13 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 | Offset | Register | Source |
 |---|---|---|
-| 0x00 / 0x04 | irq_4ke mask and status | [SDK] |
+| 0x00 / 0x04 | irq_4ke mask and status. Bit 0 timer, bit 4 MBOX_IN, bit 5 MBOX_OUT | [SDK] |
 | 0x08 / 0x0c | irq_mips mask and status. Bit 4 (MBOX_IN) follows gp_status | [HW] |
 | 0x10 / 0x14 | gp mask and status. Bit 2: the 4KE wrote. Bit 3: the host wrote. Both write-one-to-clear | [HW] |
 | 0x28 | host_mbox_in, from the 4KE to the host | [HW] |
 | 0x2c | host_mbox_out, from the host to the 4KE | [HW] |
 | 0x6c–0x80 | Translators 1 and 2 | [HW] |
+| 0x84 | scratch | [SDK] |
 | 0x8c | soft_resets, bit 0 holds the 4KE in reset | [HW] |
 
 ### Clock, reset, power and interrupts
@@ -77,7 +79,8 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 ### Still unknown
 
-- 4KE frequency and access latencies of registers, PSM, QSM and DDR;
+- 4KE frequency and access latencies of registers, PSM, QSM and DDR (phase 1 measures them);
+- which CPU interrupt line the FAP block drives (phase 1 records it);
 - what sits on COP2;
 - DQM semantics beyond the header structs;
 - how the 4KE reaches the ENETSW iuDMA registers and SRAM (to be derived from the stock 4KE code);
@@ -88,10 +91,88 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 | Phase | Content | Exit criterion | Status |
 |---|---|---|---|
 | 0 | Loader, boot, mailbox, log, memory tests | The 4KE runs and talks to the host | done |
-| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer) | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | next |
+| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer) | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | implemented, to be run on hardware |
 | 2 | Host–FAP transport: DQM queues in QSM with a "not empty" interrupt. Alternatively, our own rings in PSM | A ping that goes through the queues instead of the mailbox | |
 | 3 | Passthrough: the FAP takes the ENETSW iuDMA RX and TX channels, RX routed to the FAP, the host receives and transmits through the queues | The router works entirely through the FAP. TX completions with interrupts, so the timer is no longer needed | |
 | 4 | Flow offload: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
+
+## Phase 1: characterization
+
+The firmware now:
+
+- maps the DSPRAM in the startup code and runs with the stack at its top,
+  as the stock firmware does; the memory test covers the rest of it;
+- reads the CP0 Count resolution with `rdhwr $3`;
+- times 8192 loads and 8192 stores on one word of DSPRAM, PSM, QSM, the
+  scratch control register and DDR, plus the same loop with adds only;
+- runs on interrupts: the CP0 timer every `FAP_TIMER_PERIOD` Count ticks,
+  and the mailbox through `irq_4ke_mask` bit 5 with `FAP_GP_MBOX_OUT` added
+  to `gp_mask`. Which CPU interrupt line the FAP block drives is not known,
+  so all hardware lines are enabled and the ones seen with a ping pending
+  are recorded; lines firing for no known reason are masked and recorded.
+  The timer also polls the mailbox, so pings keep working if the FAP
+  interrupt never arrives, and the counters tell the two paths apart;
+- waits for the host to take each message before writing the next one.
+
+The host side answers pings synchronously and adds two debugfs files.
+
+### Running it on OpenWrt
+
+Build the package (`make package/bcm6362-fap/compile`), install
+`kmod-bcm6362-fap` on a board whose device tree has the FAP node, then:
+
+```
+insmod bcm6362-fap
+cd /sys/kernel/debug/11001000.coprocessor
+cat log
+cat clock          # takes one second
+echo 0x1234 > mbox
+cat stats
+```
+
+What to read:
+
+- `log`: boot registers; `intctl` bits 31:29 are the CPU line of the timer,
+  `count res` the cycles per Count tick.
+- `clock`: Count rate and core frequency, measured against the host clock
+  across two pings one second apart.
+- `stats`:
+  - `heartbeat` should grow by Count rate / `FAP_TIMER_PERIOD` per second;
+  - `timer latency` is the time from the Compare match to the handler, in
+    Count ticks: the interrupt entry cost;
+  - `mbox irq` growing means the mailbox interrupt works and `irq lines`
+    shows its Cause.IP bit; only `polled` growing means it does not reach
+    the CPU; `lost` should stay at 0;
+  - `masked` non-zero means unexpected interrupt lines;
+  - the access table gives cycles per access; `alu` is the loop cost with
+    an add in place of each load.
+
+### From the measurements to the budget
+
+At a core clock f the cycles available per packet are
+f / (T / (8 * (L + 20))) for a throughput T in bit/s and frames of L
+bytes (20 bytes of preamble and inter-frame gap). Assuming the SDK
+200 MHz, 800 Mbit/s gives about 3000 cycles per 1500 byte frame and
+about 170 per 64 byte frame. The access table says how many PSM, QSM,
+register and DDR accesses fit in there.
+
+## Upstream
+
+- The host driver boots firmware on a coprocessor, which is what
+  remoteproc is for: start/stop on `soft_resets`, the DDR block as a
+  carveout mapped by the two translators, ELF loading with `da_to_va`
+  translating 4KE addresses, the log as a trace buffer from a resource
+  table in the firmware. The mailbox becomes a mailbox controller for
+  whatever sits on top (the offload driver). The characterization in
+  debugfs stays out of tree.
+- A `brcm,bcm6362-fap` YAML binding, and the node added to
+  `arch/mips/boot/dts/brcm/bcm6362.dtsi`. The clock, reset and power
+  domain constants are already upstream.
+- The firmware binary goes to linux-firmware, with the source in this
+  repository referenced from WHENCE.
+- Phases 3 and 4 hook into the ENETSW driver, which mainline does not
+  have for bmips (OpenWrt carries `bcm6368-enetsw`): that driver has to be
+  upstream before the offload can be.
 
 ## Device tree examples
 

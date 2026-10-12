@@ -10,7 +10,7 @@ CFLAGS := -march=mips32r2 -mtune=4kec -EB -msoft-float -mno-abicalls -fno-pic -G
 	  -Wall -Wextra -I..
 LDFLAGS := -nostdlib -static -Wl,--build-id=none
 
-OBJS := start.o main.o
+OBJS := start.o bench.o main.o
 
 all: bcm6362-fap.bin
 
@@ -20,13 +20,13 @@ bcm6362-fap.bin: bcm6362-fap.elf
 bcm6362-fap.elf: $(OBJS) fap.lds
 	$(CC) $(CFLAGS) $(LDFLAGS) -T fap.lds -o $@ $(OBJS)
 
-fap.lds: fap.lds.S ../fap_shared.h
+fap.lds: fap.lds.S ../fap_shared.h fap4ke.h
 	$(CC) -E -P -undef -x c -D__ASSEMBLER__ -I.. -o $@ $<
 
-%.o: %.S ../fap_shared.h
+%.o: %.S ../fap_shared.h fap4ke.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.o: %.c ../fap_shared.h
+%.o: %.c ../fap_shared.h fap4ke.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
