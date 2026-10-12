@@ -33,9 +33,9 @@
 #define FAP_REG_MBOX_OUT	0x2c		/* host to 4KE */
 
 /*
- * 4KE to host messages: type in the upper half, value in the lower one.
- * Every host write to FAP_REG_MBOX_OUT is a ping, answered by a pong that
- * carries the lower half of the written value.
+ * Mailbox messages, both ways: type in the upper half, value in the lower
+ * one. The 4KE answers each host command with a pong carrying the lower
+ * half of the command, once the command is done.
  */
 #define FAP_MSG(type, val)	(((type) << 16) | ((val) & 0xffff))
 #define FAP_MSG_TYPE(msg)	((msg) >> 16)
@@ -47,6 +47,12 @@
 #define  FAP_READY_QSM		(1 << 2)	/* memory test passed */
 #define FAP_MSG_PONG		2
 #define FAP_MSG_EXCEPTION	3
+
+#define FAP_CMD_PING		0
+#define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
+
+/* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
+#define FAP_IUDMA_PROBE_CHANNELS	2
 
 #define FAP_SHARED_MAGIC	0x46415034
 
@@ -76,6 +82,17 @@ struct fap_bench {
 	unsigned int store;		/* stores, then sync */
 };
 
+/* ENETSW iuDMA as read by the 4KE */
+struct fap_iudma {
+	unsigned int controller_cfg;
+	struct {
+		unsigned int cfg;
+		unsigned int ring;	/* state RAM: descriptor ring start */
+	} ch[FAP_IUDMA_PROBE_CHANNELS];
+	unsigned int load_regs;		/* benchmark ticks, controller_cfg */
+	unsigned int load_sram;		/* benchmark ticks, state RAM */
+};
+
 struct fap_shared {
 	unsigned int magic;
 	unsigned int heartbeat;		/* timer interrupts */
@@ -90,6 +107,7 @@ struct fap_shared {
 
 	unsigned int bench_alu;		/* the load loop, an add for each load */
 	struct fap_bench bench[FAP_BENCH_NR];
+	struct fap_iudma iudma;
 
 	char log[FAP_LOG_SIZE];
 };

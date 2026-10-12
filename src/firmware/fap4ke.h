@@ -19,6 +19,12 @@
 /* general purpose register of the control block, free for any use */
 #define FAP_REG_SCRATCH		0x84
 
+/* ENETSW iuDMA, at its host physical address */
+#define ENETSW_DMA		0x1000d800
+#define IUDMA_CHANNELS		0x200
+#define IUDMA_SRAM		0x400
+#define IUDMA_CH_STRIDE		0x10
+
 /* data scratchpad, at the physical address the SDK firmware uses */
 #define DSPRAM_BASE		0x4000
 #define DSPRAM_SIZE		0x2000

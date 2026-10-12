@@ -51,6 +51,9 @@ static volatile unsigned int ddr_word;
 static volatile unsigned int main_loops __attribute__((section(".dspram")));
 static unsigned int main_loops_seen __attribute__((section(".dspram")));
 
+/* host command left by the interrupt handler for the main loop */
+static volatile unsigned int command __attribute__((section(".dspram")));
+
 static unsigned int reg_rd(unsigned int off)
 {
 	return *(volatile unsigned int *)(FAP_4KE_REGS + off);
@@ -113,14 +116,10 @@ static void mbox_send(unsigned int type, unsigned int val)
 	reg_wr(FAP_REG_MBOX_IN, FAP_MSG(type, val));
 }
 
-static void mbox_pong(void)
+static void mbox_pong(unsigned int cmd)
 {
-	unsigned int msg;
-
-	reg_wr(FAP_REG_GP_STATUS, FAP_GP_MBOX_OUT);
-	msg = reg_rd(FAP_REG_MBOX_OUT);
 	shared->pong_count = read_c0(CP0_COUNT, 0);
-	mbox_send(FAP_MSG_PONG, msg);
+	mbox_send(FAP_MSG_PONG, cmd);
 }
 
 static void irq_timer(void)
@@ -147,9 +146,19 @@ static void irq_timer(void)
 
 static void irq_fap(void)
 {
-	if (reg_rd(FAP_REG_IRQ_4KE_STATUS) & FAP_IRQ_4KE_MBOX_OUT) {
+	unsigned int cmd;
+
+	if (!(reg_rd(FAP_REG_IRQ_4KE_STATUS) & FAP_IRQ_4KE_MBOX_OUT))
+		return;
+
+	reg_wr(FAP_REG_GP_STATUS, FAP_GP_MBOX_OUT);
+	cmd = reg_rd(FAP_REG_MBOX_OUT);
+
+	if (FAP_MSG_TYPE(cmd) == FAP_CMD_PING) {
 		shared->pings++;
-		mbox_pong();
+		mbox_pong(cmd);
+	} else {
+		command = cmd;
 	}
 }
 
@@ -264,6 +273,36 @@ static void bench(void)
 	}
 }
 
+/*
+ * The 4KE reads the iuDMA at the address the host uses. The host driver
+ * owns it, so nothing is written.
+ */
+static void iudma_probe(void)
+{
+	volatile unsigned int *dma = (volatile unsigned int *)KSEG1(ENETSW_DMA);
+	int ch;
+
+	shared->iudma.controller_cfg = dma[0];
+	for (ch = 0; ch < FAP_IUDMA_PROBE_CHANNELS; ch++) {
+		shared->iudma.ch[ch].cfg =
+			dma[(IUDMA_CHANNELS + ch * IUDMA_CH_STRIDE) / 4];
+		shared->iudma.ch[ch].ring =
+			dma[(IUDMA_SRAM + ch * IUDMA_CH_STRIDE) / 4];
+	}
+
+	shared->iudma.load_regs = bench_load(dma, FAP_BENCH_ITERS);
+	shared->iudma.load_sram = bench_load(&dma[IUDMA_SRAM / 4],
+					     FAP_BENCH_ITERS);
+}
+
+static void run_command(unsigned int cmd)
+{
+	if (FAP_MSG_TYPE(cmd) == FAP_CMD_PROBE_IUDMA)
+		iudma_probe();
+
+	mbox_pong(cmd);
+}
+
 static void irq_init(void)
 {
 	shared->timer_lat_min = ~0u;
@@ -294,6 +333,7 @@ void fap_main(void)
 	reg_wr(FAP_REG_GP_STATUS, FAP_GP_MBOX_OUT);
 	main_loops = 0;
 	main_loops_seen = 0;
+	command = 0;
 	shared->magic = FAP_SHARED_MAGIC;
 	shared->count_res = count_res();
 
@@ -320,7 +360,13 @@ void fap_main(void)
 	log_reg("gp mask", reg_rd(FAP_REG_GP_MASK));
 
 	for (;;) {
+		unsigned int cmd = command;
+
 		main_loops++;
+		if (cmd) {
+			command = 0;
+			run_command(cmd);
+		}
 		__asm__ volatile("wait");
 	}
 }

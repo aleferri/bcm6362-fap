@@ -456,6 +456,40 @@ static int stats_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(stats);
 
+/* how the 4KE sees the ENETSW iuDMA; compare with the host side values */
+static int iudma_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+	struct fap_iudma *iudma = &fap->shared->iudma;
+	u32 cmd, regs, sram;
+	int ch, ret;
+
+	mutex_lock(&fap->lock);
+	cmd = FAP_MSG(FAP_CMD_PROBE_IUDMA, ++fap->ping_seq);
+	ret = bcm6362_fap_ping(fap, cmd, NULL, NULL);
+	mutex_unlock(&fap->lock);
+	if (ret)
+		return ret;
+
+	/* pairs with the sync the firmware issues before the pong */
+	rmb();
+
+	seq_printf(s, "controller_cfg  0x%08x\n",
+		   READ_ONCE(iudma->controller_cfg));
+	for (ch = 0; ch < FAP_IUDMA_PROBE_CHANNELS; ch++)
+		seq_printf(s, "channel %d       cfg 0x%08x ring 0x%08x\n", ch,
+			   READ_ONCE(iudma->ch[ch].cfg),
+			   READ_ONCE(iudma->ch[ch].ring));
+
+	regs = bench_centicycles(fap, READ_ONCE(iudma->load_regs));
+	sram = bench_centicycles(fap, READ_ONCE(iudma->load_sram));
+	seq_printf(s, "cycles per load regs %u.%02u state ram %u.%02u\n",
+		   regs / 100, regs % 100, sram / 100, sram % 100);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(iudma);
+
 static void bcm6362_fap_debugfs_remove(void *data)
 {
 	debugfs_remove_recursive(data);
@@ -566,6 +600,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("mbox", 0600, fap->debugfs, fap, &mbox_fops);
 	debugfs_create_file("clock", 0400, fap->debugfs, fap, &clock_fops);
 	debugfs_create_file("stats", 0400, fap->debugfs, fap, &stats_fops);
+	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
 	if (fap->qsm)
 		debugfs_create_file("qsm", 0400, fap->debugfs, fap, &qsm_fops);
 	if (fap->psm)

@@ -96,7 +96,7 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 - what sits on COP2;
 - DQM semantics beyond the header structs;
-- how the 4KE reaches the ENETSW iuDMA registers and SRAM (to be derived from the stock 4KE code), and what an access costs;
+- how the 4KE reaches the ENETSW iuDMA registers and SRAM, and what an access costs. The SDK uses the same `SWITCH_DMA_BASE` for host and 4KE code, so the phase 1 probe tries the host physical address [ded.];
 - the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
 - whether the CP0 Count keeps running while the 4KE sits in WAIT.
 
@@ -156,7 +156,11 @@ The firmware now:
   only if they moved since the previous tick;
 - sleeps in WAIT between interrupts. If the Count stopped in WAIT the
   timer would never wake the core, the heartbeat would stall and the
-  watchdog would report the core as crashed.
+  watchdog would report the core as crashed;
+- on a host command, reads the ENETSW iuDMA at its host physical address
+  through kseg1 (controller configuration, configuration and ring start
+  of channels 0 and 1) and times loads of a register and of the state
+  RAM. It only reads: the enetsw driver owns the iuDMA.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
@@ -177,7 +181,16 @@ cat log
 cat clock          # takes one second
 echo 0x1234 > mbox
 cat stats
+cat iudma
+devmem 0x1000d800; devmem 0x1000da00; devmem 0x1000dc00
 ```
+
+`iudma` should report the same `controller_cfg`, channel 0 `cfg` and
+channel 0 `ring` as the three `devmem` reads on the host. If the 4KE
+cannot reach the iuDMA there, the read either faults, and the log shows
+the exception, or never completes, and the watchdog stops the core. A
+transaction stuck on the bus could also hang the host, so run it last,
+with a serial console at hand.
 
 `state` reads `crashed` after the watchdog stopped the core; the reason
 is in the kernel log.
