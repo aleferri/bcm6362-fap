@@ -67,6 +67,12 @@
 #define FAP_BENCH_ITERS		1024
 #define FAP_BENCH_UNROLL	8
 
+/* DDR loads alternating between two words this far apart, i < 2 */
+#define FAP_BENCH_DDR_FAR(i)	(0x1000 << (3 * (i)))
+
+/* ports of the internal switch, each with its RX iuDMA channel map */
+#define FAP_SWITCH_PORTS	9
+
 #ifndef __ASSEMBLER__
 enum fap_bench_target {
 	FAP_BENCH_DSPRAM,
@@ -92,6 +98,7 @@ struct fap_iudma {
 	} ch[FAP_IUDMA_PROBE_CHANNELS];
 	unsigned int load_regs;		/* benchmark ticks, controller_cfg */
 	unsigned int load_sram;		/* benchmark ticks, state RAM */
+	unsigned short switch_rx_map[FAP_SWITCH_PORTS];
 };
 
 struct fap_shared {
@@ -108,6 +115,7 @@ struct fap_shared {
 
 	unsigned int bench_alu;		/* the load loop, an add for each load */
 	struct fap_bench bench[FAP_BENCH_NR];
+	unsigned int bench_ddr_far[2];	/* load ticks, see FAP_BENCH_DDR_FAR */
 	struct fap_iudma iudma;
 
 	char log[FAP_LOG_SIZE];

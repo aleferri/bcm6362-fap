@@ -452,6 +452,12 @@ static int stats_show(struct seq_file *s, void *unused)
 		seq_printf(s, "%-16s %4u.%02u %4u.%02u\n", names[i],
 			   load / 100, load % 100, store / 100, store % 100);
 	}
+	for (i = 0; i < ARRAY_SIZE(sh->bench_ddr_far); i++) {
+		load = bench_centicycles(fap,
+					 READ_ONCE(sh->bench_ddr_far[i]));
+		seq_printf(s, "ddr %5u apart %4u.%02u\n", FAP_BENCH_DDR_FAR(i),
+			   load / 100, load % 100);
+	}
 
 	return 0;
 }
@@ -463,7 +469,7 @@ static int iudma_show(struct seq_file *s, void *unused)
 	struct bcm6362_fap *fap = s->private;
 	struct fap_iudma *iudma = &fap->shared->iudma;
 	u32 cmd, regs, sram;
-	int ch, ret;
+	int ch, port, ret;
 
 	mutex_lock(&fap->lock);
 	cmd = FAP_MSG(FAP_CMD_PROBE_IUDMA, ++fap->ping_seq);
@@ -486,6 +492,11 @@ static int iudma_show(struct seq_file *s, void *unused)
 	sram = bench_centicycles(fap, READ_ONCE(iudma->load_sram));
 	seq_printf(s, "cycles per load regs %u.%02u state ram %u.%02u\n",
 		   regs / 100, regs % 100, sram / 100, sram % 100);
+
+	seq_puts(s, "switch rx map  ");
+	for (port = 0; port < FAP_SWITCH_PORTS; port++)
+		seq_printf(s, " %04x", READ_ONCE(iudma->switch_rx_map[port]));
+	seq_putc(s, '\n');
 
 	return 0;
 }

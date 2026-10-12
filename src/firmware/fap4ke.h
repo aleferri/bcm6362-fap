@@ -22,6 +22,10 @@
 #define IUDMA_SRAM		0x400
 #define IUDMA_CH_STRIDE		0x10
 
+/* ENETSW internal switch, per port priority to RX iuDMA channel map */
+#define ENETSW_SWITCH		0x10e00000
+#define SWITCH_RX_MAP		0x3050
+
 /* data scratchpad, at the physical address the SDK firmware uses */
 #define DSPRAM_BASE		0x4000
 #define DSPRAM_SIZE		0x2000

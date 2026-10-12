@@ -6,6 +6,8 @@
  * unsigned int bench_alu(volatile unsigned int *p, unsigned int iters);
  * unsigned int bench_load(volatile unsigned int *p, unsigned int iters);
  * unsigned int bench_store(volatile unsigned int *p, unsigned int iters);
+ * unsigned int bench_load_pair(volatile unsigned int *p,
+ *				volatile unsigned int *q, unsigned int iters);
  */
 
 #include "fap_shared.h"
@@ -37,6 +39,23 @@ bench_load:
 	.endr
 	addiu	$a1, $a1, -1
 	bnez	$a1, 1b
+	 nop
+	mfc0	$v0, CP0_COUNT
+	jr	$ra
+	 subu	$v0, $v0, $t9
+
+/* as bench_load, alternating between two words */
+	.globl	bench_load_pair
+bench_load_pair:
+	mfc0	$t9, CP0_COUNT
+1:	.rept	FAP_BENCH_UNROLL / 2
+	lw	$t0, 0($a0)
+	addu	$v1, $v1, $t0
+	lw	$t0, 0($a1)
+	addu	$v1, $v1, $t0
+	.endr
+	addiu	$a2, $a2, -1
+	bnez	$a2, 1b
 	 nop
 	mfc0	$v0, CP0_COUNT
 	jr	$ra

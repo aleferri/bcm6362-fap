@@ -190,7 +190,9 @@ The firmware now:
   as the stock firmware does; the memory test covers the rest of it;
 - reads the CP0 Count resolution with `rdhwr $3`;
 - times 8192 loads and 8192 stores on one word of DSPRAM, PSM, QSM, the
-  scratch control register and DDR, plus the same loop with adds only;
+  scratch control register and DDR, plus the same loop with adds only,
+  and DDR loads alternating between two words 4 KB and 32 KB apart, to
+  see the cost of leaving the open row;
 - runs on interrupts: the CP0 timer on IP7 every `FAP_TIMER_PERIOD`
   Count ticks, and the mailbox on IP2 through `irq_4ke_mask` bit 5 with
   `FAP_GP_MBOX_OUT` added to `gp_mask`;
@@ -203,7 +205,8 @@ The firmware now:
 - on a host command, reads the ENETSW iuDMA at its host physical address
   through kseg1 (controller configuration, configuration and ring start
   of channels 0 and 1) and times loads of a register and of the state
-  RAM. It only reads: the enetsw driver owns the iuDMA.
+  RAM; it also reads the per port RX channel map of the internal switch.
+  It only reads: the enetsw and b53 drivers own those blocks.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
@@ -259,7 +262,10 @@ What to read:
     Count ticks: the interrupt entry cost;
   - `pings` counts the pings answered, `lost` should stay at 0;
   - the access table gives cycles per access; `alu` is the loop cost with
-    an add in place of each load.
+    an add in place of each load; the `ddr ... apart` lines are the loads
+    alternating between two distant words.
+- `iudma`: the last line is the switch RX channel map of ports 0 to 8, as
+  left by the switch reset and the b53 driver.
 
 ### From the measurements to the budget
 
