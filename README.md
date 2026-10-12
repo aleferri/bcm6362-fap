@@ -83,7 +83,8 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - Clock, reset, IDDQ: the FAP clock bit is 18, the reset bit 13, the IDDQ bit 11. The kernel providers already handle them. [HW]
 - Interrupt to the host: peripheral line 29. [HW]
 - Interrupts to the FAP: peripherals can be routed to the FAP through miscFapIrqMask, Extra and Extra2. The stock firmware routed the ENETSW RX DMAs and the SAR DMAs there. [SDK]
-- ENETSW on the 6362: it only has RX DMA lines 0–3, no TX. [SDK]
+- ENETSW DMA interrupts: RX 0–3 reach the host interrupt controller; TX 0–3 only exist in extra2ChipIrqStatus, which can be routed to the FAP through extra2FapIrqMask, so only the FAP can get TX completion interrupts. [SDK]
+- Switch to iuDMA RX channel: the internal switch has a 16-bit priority ID map per port (9 ports, `pri_id_map` at switch offset 0x3050), described as controlling the RX iuDMA channel. Its exact layout is unknown. [SDK]
 
 ### Boot [HW]
 
@@ -148,8 +149,9 @@ which keeps working without offload; its TX channel was never touched.
 A FAP that stalls or faults is also held in reset, with its log kept for
 inspection.
 
-Moving RX can be done in two ways, to be chosen once the switch is
-understood:
+Moving RX can be done in two ways; the second is preferred, and the
+switch per port priority map that selects the RX channel [SDK] makes it
+likely possible:
 
 - the FAP takes over the host RX channel, which the enetsw driver stops
   on activation and restarts on deactivation;
@@ -173,9 +175,12 @@ has to be routed to the FAP with miscFapIrqMask [SDK].
 | 4 | Flow offload with TX splitting: the FAP gets its own TX channel. nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards; the host writes the flow table directly into PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits on its channel; the rest goes to the host as in phase 3. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
 
 Today the enetsw driver reclaims transmitted descriptors in its NAPI
-poll, which on the 6362 only the RX interrupt schedules, since the ENETSW
-has no TX interrupt lines. With RX on the FAP, the host needs another
-trigger for that reclaim: the interrupt of the phase 2 queue, or a timer.
+poll, which on the 6362 only the RX interrupt schedules, since the TX
+DMA interrupts do not reach the host. With RX on the FAP, the interrupt
+the FAP raises for the phase 2 queue schedules that poll instead. On
+the DSL-3580L all LAN and WAN traffic enters the internal switch on
+port 4, so a per port map moves all of it at once, which is what RX
+delegation needs.
 
 ## Phase 1: characterization
 
@@ -221,7 +226,12 @@ echo 0x1234 > mbox
 cat stats
 cat iudma
 devmem 0x1000d800; devmem 0x1000da00; devmem 0x1000dc00
+cat hostbench
 ```
+
+`hostbench` times host loads and stores on the FAP scratch register, QSM,
+PSM and DDR, uncached and cached, in ns per access: it decides where the
+phase 2 queues go.
 
 `iudma` should report the same `controller_cfg`, channel 0 `cfg` and
 channel 0 `ring` as the three `devmem` reads on the host. If the 4KE

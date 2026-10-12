@@ -31,6 +31,7 @@
 #define  FAP_GP_MBOX_OUT	(1 << 3)	/* host wrote FAP_REG_MBOX_OUT */
 #define FAP_REG_MBOX_IN		0x28		/* 4KE to host */
 #define FAP_REG_MBOX_OUT	0x2c		/* host to 4KE */
+#define FAP_REG_SCRATCH		0x84		/* free for any use */
 
 /*
  * Mailbox messages, both ways: type in the upper half, value in the lower

@@ -52,6 +52,7 @@
 #define FAP_PING_TIMEOUT_MS	100
 #define FAP_CLOCK_SAMPLE_MS	1000
 #define FAP_WATCHDOG_MS		1000
+#define FAP_HOST_BENCH_ACCESSES	4096
 
 static char *firmware = "bcm6362-fap.bin";
 module_param(firmware, charp, 0444);
@@ -490,6 +491,75 @@ static int iudma_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(iudma);
 
+/*
+ * Host access timings on one word of each target, in hundredths of a ns
+ * per access. Loads add the loaded value; stores write back the value the
+ * word already holds and end with a read back, so that posted writes are
+ * counted.
+ */
+static void host_bench(void __iomem *p, u32 *load, u32 *store)
+{
+	unsigned long flags;
+	u32 sum = 0, val;
+	u64 t0, t1, t2;
+	int i;
+
+	local_irq_save(flags);
+
+	t0 = ktime_get_ns();
+	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
+		sum += __raw_readl(p);
+	t1 = ktime_get_ns();
+
+	val = __raw_readl(p);
+	for (i = 0; i < FAP_HOST_BENCH_ACCESSES; i++)
+		__raw_writel(val, p);
+	sum += __raw_readl(p);
+	t2 = ktime_get_ns();
+
+	local_irq_restore(flags);
+
+	OPTIMIZER_HIDE_VAR(sum);
+	*load = div_u64((t1 - t0) * 100, FAP_HOST_BENCH_ACCESSES);
+	*store = div_u64((t2 - t1) * 100, FAP_HOST_BENCH_ACCESSES);
+}
+
+static void host_bench_show(struct seq_file *s, const char *name,
+			    void __iomem *p)
+{
+	u32 load, store;
+
+	host_bench(p, &load, &store);
+	seq_printf(s, "%-16s %6u.%02u %6u.%02u\n", name,
+		   load / 100, load % 100, store / 100, store % 100);
+}
+
+static int hostbench_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+	u32 *cached;
+
+	cached = kzalloc(sizeof(*cached), GFP_KERNEL);
+	if (!cached)
+		return -ENOMEM;
+
+	seq_puts(s, "ns per access        load      store\n");
+	host_bench_show(s, "regs", fap->regs + FAP_REG_SCRATCH);
+	if (fap->qsm)
+		host_bench_show(s, "qsm", fap->qsm);
+	if (fap->psm)
+		host_bench_show(s, "psm", fap->psm);
+	/* the last word of the block, past the shared area */
+	host_bench_show(s, "ddr uncached",
+			(void __force __iomem *)fap->mem + FAP_MEM_SIZE - 4);
+	host_bench_show(s, "ddr cached", (void __force __iomem *)cached);
+
+	kfree(cached);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hostbench);
+
 static void bcm6362_fap_debugfs_remove(void *data)
 {
 	debugfs_remove_recursive(data);
@@ -601,6 +671,8 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("clock", 0400, fap->debugfs, fap, &clock_fops);
 	debugfs_create_file("stats", 0400, fap->debugfs, fap, &stats_fops);
 	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
+	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
+			    &hostbench_fops);
 	if (fap->qsm)
 		debugfs_create_file("qsm", 0400, fap->debugfs, fap, &qsm_fops);
 	if (fap->psm)

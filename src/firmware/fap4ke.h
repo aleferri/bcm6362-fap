@@ -16,9 +16,6 @@
 #define FAP_4KE_QSM		0xe0004000
 #define FAP_4KE_PSM		0xe0010000
 
-/* general purpose register of the control block, free for any use */
-#define FAP_REG_SCRATCH		0x84
-
 /* ENETSW iuDMA, at its host physical address */
 #define ENETSW_DMA		0x1000d800
 #define IUDMA_CHANNELS		0x200
