@@ -33,8 +33,17 @@ the same word, so the DDR figure is a best case with the row already open.
 | PSM, QSM | 7 | 4.6 |
 | FAP control registers | 6 | 6.6 |
 | DDR | 30.6 | 7.6 |
+| ENETSW iuDMA registers | 42 | not measured |
+| ENETSW iuDMA state RAM | 43 | not measured |
 
 Source: [HW], phase 1 benchmark. Stores go through the write buffer.
+The iuDMA is only read, since the enetsw driver owns it.
+
+The 4KE reaches the ENETSW iuDMA at its host physical address 0x1000d800
+through kseg1: it reads the controller enabled, RX channel 0 enabled and
+two page aligned ring addresses inside the RAM, as the enetsw driver sets
+them [HW]. WAIT keeps the CP0 Count running, so the timer wakes the core
+[HW].
 
 ### Address map
 
@@ -96,9 +105,9 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 
 - what sits on COP2;
 - DQM semantics beyond the header structs;
-- how the 4KE reaches the ENETSW iuDMA registers and SRAM, and what an access costs. The SDK uses the same `SWITCH_DMA_BASE` for host and 4KE code, so the phase 1 probe tries the host physical address [ded.];
+- the cost of stores to the iuDMA, and whether the iuDMA can use descriptors in QSM, as the stock firmware does for ENET RX;
+- the cost of host accesses to QSM and PSM over UBUS;
 - the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
-- whether the CP0 Count keeps running while the 4KE sits in WAIT.
 
 ## Operating model
 
@@ -224,7 +233,10 @@ on average. A forwarded packet needing some ten header loads from DDR
 (about 300 cycles), a PSM table lookup (about 150) plus descriptors and
 stores stays well under 1000 cycles, so 700–800 Mbit/s with full size
 frames looks reachable, while small frames at line rate do not. The
-iuDMA access cost, still to be measured, is the main open term.
+iuDMA itself is the expensive part, over 40 cycles per load, more than
+DDR: the per packet path should read descriptor ownership from memory
+rather than the iuDMA registers, and only write to the iuDMA (channel
+kick, interrupt acknowledge).
 
 ## Upstream
 
