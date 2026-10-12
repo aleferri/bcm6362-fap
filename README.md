@@ -211,7 +211,9 @@ The firmware now:
   RAM; it also reads the per port RX channel map of the internal switch.
   It only reads: the enetsw and b53 drivers own those blocks;
 - on another host command, reads its own shared area at the host physical
-  address of the block, outside the translator windows, and times it.
+  address of the block, outside the translator windows, and times it;
+- on a third one, moves EBase onto the block through the boot window, so
+  that the low translator at 0 is only needed until then.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
@@ -236,6 +238,10 @@ cat iudma
 devmem 0x1000d800; devmem 0x1000da00; devmem 0x1000dc00
 cat hostbench
 cat ddr
+echo move > ebase; cat ebase
+cat stats; echo 0x1234 > mbox; cat stats
+echo park > ebase; cat ebase
+cat stats; echo 0x1234 > mbox; cat stats
 ```
 
 `hostbench` times host loads and stores on the FAP scratch register, QSM,
@@ -275,6 +281,11 @@ What to read:
 - `ddr`: the magic read back means the 4KE reaches any DDR address
   directly. Like `iudma`, a wrong guess shows up as an exception or a
   watchdog stop, so run it last.
+- `ebase`: after `move` it should read 0x9fc00000; heartbeat and pings
+  growing afterwards mean the interrupts take the new vector. `park`
+  moves the low translator away from 0 (no enable bit is known, so it is
+  pointed at an address the firmware never uses); heartbeat and pings
+  growing after it mean the low window is no longer needed.
 
 ### From the measurements to the budget
 

@@ -41,12 +41,14 @@
 #define CP0_CAUSE		$13
 #define CP0_EPC			$14
 #define CP0_PRID		$15
+#define CP0_EBASE		$15		/* select 1 */
 #define CP0_CONFIG		$16
 #define CP0_ERRCTL		$26
 #define CP0_TAGLO		$28
 #define CP0_TAGHI		$29
 
 #define ST0_IE			(1 << 0)
+#define ST0_BEV			(1 << 22)
 #define ST0_IM_FAP		(1 << 10)	/* IP2: irq_4ke_status */
 #define ST0_IM_TIMER		(1 << 15)	/* IP7: CP0 Count/Compare */
 

@@ -14,6 +14,9 @@
 /* 4KE physical address the block is mapped at to cover the reset vector */
 #define FAP_4KE_BOOT_BASE	0x1fc00000
 
+/* exception base moved onto the block, kseg0 */
+#define FAP_4KE_EBASE		(0x80000000 | FAP_4KE_BOOT_BASE)
+
 /* queue and packet shared memories, local to the FAP */
 #define FAP_QSM_SIZE		0x4000
 #define FAP_PSM_SIZE		0x8000
@@ -52,6 +55,7 @@
 #define FAP_CMD_PING		0
 #define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
 #define FAP_CMD_PROBE_DDR	2	/* value: host address of the block >> 16 */
+#define FAP_CMD_MOVE_EBASE	3	/* fills fap_shared.ebase */
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -122,6 +126,8 @@ struct fap_shared {
 	/* the shared area read at its host physical address, untranslated */
 	unsigned int ddr_direct_magic;
 	unsigned int ddr_direct_load;	/* benchmark ticks */
+
+	unsigned int ebase;		/* read back after FAP_CMD_MOVE_EBASE */
 
 	char log[FAP_LOG_SIZE];
 };

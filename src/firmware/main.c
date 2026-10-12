@@ -326,6 +326,22 @@ static void ddr_probe(unsigned int block)
 	shared->ddr_direct_load = bench_load(magic, FAP_BENCH_ITERS);
 }
 
+/*
+ * Vectors on the block through the boot window instead of the low one at
+ * 0, which the host can then reuse. EBase may only change with BEV set.
+ */
+static void ebase_move(void)
+{
+	unsigned int status = read_c0(CP0_STATUS, 0);
+
+	write_c0(CP0_STATUS, 0, (status & ~ST0_IE) | ST0_BEV);
+	write_c0(CP0_EBASE, 1, FAP_4KE_EBASE);
+	write_c0(CP0_STATUS, 0, status);
+
+	shared->ebase = read_c0(CP0_EBASE, 1);
+	log_reg("ebase", shared->ebase);
+}
+
 static void run_command(unsigned int cmd)
 {
 	switch (FAP_MSG_TYPE(cmd)) {
@@ -334,6 +350,9 @@ static void run_command(unsigned int cmd)
 		break;
 	case FAP_CMD_PROBE_DDR:
 		ddr_probe(FAP_MSG_VALUE(cmd));
+		break;
+	case FAP_CMD_MOVE_EBASE:
+		ebase_move();
 		break;
 	}
 
