@@ -5,12 +5,17 @@
  * Boots a firmware image on the MIPS 4KE core of the FAP block: the image is
  * placed in a host memory block that the FAP address translators map both at
  * the 4KE reset vector and at 4KE physical address 0 (exception vectors).
+ *
+ * The firmware boots with the driver and stays idle. A watchdog holds the
+ * 4KE in reset if its heartbeat stalls or it reports an exception.
  */
 
+#include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/devm-helpers.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
@@ -23,6 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/seq_file.h>
+#include <linux/workqueue.h>
 
 #include "fap_shared.h"
 
@@ -45,10 +51,23 @@
 
 #define FAP_PING_TIMEOUT_MS	100
 #define FAP_CLOCK_SAMPLE_MS	1000
+#define FAP_WATCHDOG_MS		1000
 
 static char *firmware = "bcm6362-fap.bin";
 module_param(firmware, charp, 0444);
 MODULE_PARM_DESC(firmware, "4KE firmware image in /lib/firmware");
+
+enum bcm6362_fap_state {
+	FAP_OFFLINE,	/* held in reset by the host */
+	FAP_IDLE,	/* running, waiting for work */
+	FAP_CRASHED,	/* held in reset by the watchdog, log kept */
+};
+
+static const char *const bcm6362_fap_state_names[] = {
+	[FAP_OFFLINE] = "offline",
+	[FAP_IDLE] = "idle",
+	[FAP_CRASHED] = "crashed",
+};
 
 struct bcm6362_fap {
 	struct device *dev;
@@ -63,8 +82,13 @@ struct bcm6362_fap {
 	u32 mbox_last;
 	unsigned int mbox_count;
 
-	/* serializes pings */
+	/* serializes state changes and pings */
 	struct mutex lock;
+	enum bcm6362_fap_state state;
+	struct delayed_work watchdog;
+	u32 heartbeat;
+	bool exception;
+
 	u16 ping_seq;
 	struct completion pong;
 	u32 pong_msg;
@@ -148,6 +172,8 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 	case FAP_MSG_EXCEPTION:
 		dev_err(fap->dev, "4KE exception, ExcCode %u\n",
 			FAP_MSG_VALUE(msg));
+		WRITE_ONCE(fap->exception, true);
+		mod_delayed_work(system_wq, &fap->watchdog, 0);
 		break;
 	default:
 		dev_dbg(fap->dev, "mailbox 0x%08x\n", msg);
@@ -157,11 +183,52 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static void bcm6362_fap_hold(struct bcm6362_fap *fap)
+{
+	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) | FAP_SOFT_RESET_4KE,
+	       FAP_REG_SOFT_RESETS);
+	fap_wr(fap, 0, FAP_REG_IRQ_4KE_MASK);
+	fap_wr(fap, 0, FAP_REG_IRQ_MIPS_MASK);
+	fap_wr(fap, 0, FAP_REG_GP_MASK);
+}
+
+static void bcm6362_fap_watchdog(struct work_struct *work)
+{
+	struct bcm6362_fap *fap = container_of(to_delayed_work(work),
+					       struct bcm6362_fap, watchdog);
+	u32 heartbeat;
+
+	guard(mutex)(&fap->lock);
+
+	if (fap->state != FAP_IDLE)
+		return;
+
+	heartbeat = READ_ONCE(fap->shared->heartbeat);
+
+	if (READ_ONCE(fap->exception)) {
+		dev_err(fap->dev, "4KE held in reset after an exception\n");
+	} else if (heartbeat == fap->heartbeat) {
+		dev_err(fap->dev, "4KE held in reset, heartbeat stuck at %u\n",
+			heartbeat);
+	} else {
+		fap->heartbeat = heartbeat;
+		schedule_delayed_work(&fap->watchdog,
+				      msecs_to_jiffies(FAP_WATCHDOG_MS));
+		return;
+	}
+
+	bcm6362_fap_hold(fap);
+	fap->state = FAP_CRASHED;
+}
+
 /* the 4KE answers with the low half of val and the CP0 Count it sent at */
 static int bcm6362_fap_ping(struct bcm6362_fap *fap, u32 val,
 			    ktime_t *time, u32 *count)
 {
 	lockdep_assert_held(&fap->lock);
+
+	if (fap->state != FAP_IDLE)
+		return -ENODEV;
 
 	reinit_completion(&fap->pong);
 	fap_wr(fap, val, FAP_REG_MBOX_OUT);
@@ -307,6 +374,16 @@ static ssize_t mbox_write(struct file *file, const char __user *buf,
 }
 DEFINE_SHOW_STORE_ATTRIBUTE(mbox);
 
+static int state_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+
+	seq_printf(s, "%s\n", bcm6362_fap_state_names[READ_ONCE(fap->state)]);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(state);
+
 /* CP0 Count rate, against the host clock across two pings */
 static int clock_show(struct seq_file *s, void *unused)
 {
@@ -403,10 +480,9 @@ static void bcm6362_fap_halt(void *data)
 {
 	struct bcm6362_fap *fap = data;
 
-	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) | FAP_SOFT_RESET_4KE,
-	       FAP_REG_SOFT_RESETS);
-	fap_wr(fap, 0, FAP_REG_IRQ_MIPS_MASK);
-	fap_wr(fap, 0, FAP_REG_GP_MASK);
+	guard(mutex)(&fap->lock);
+	bcm6362_fap_hold(fap);
+	fap->state = FAP_OFFLINE;
 }
 
 static int bcm6362_fap_probe(struct platform_device *pdev)
@@ -455,11 +531,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) | FAP_SOFT_RESET_4KE,
-	       FAP_REG_SOFT_RESETS);
-	fap_wr(fap, 0, FAP_REG_IRQ_4KE_MASK);
-	fap_wr(fap, 0, FAP_REG_IRQ_MIPS_MASK);
-	fap_wr(fap, 0, FAP_REG_GP_MASK);
+	bcm6362_fap_hold(fap);
 
 	fap->mem = dmam_alloc_coherent(dev, FAP_MEM_SIZE, &fap->mem_dma,
 				       GFP_KERNEL);
@@ -479,12 +551,19 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	bcm6362_fap_map(fap, FAP_REG_ADDR1, 0);
 	bcm6362_fap_map(fap, FAP_REG_ADDR2, FAP_4KE_BOOT_BASE);
 
+	/* the interrupt handler kicks the watchdog on exceptions */
+	ret = devm_delayed_work_autocancel(dev, &fap->watchdog,
+					   bcm6362_fap_watchdog);
+	if (ret)
+		return ret;
+
 	ret = devm_request_irq(dev, irq, bcm6362_fap_isr, 0, dev_name(dev),
 			       fap);
 	if (ret)
 		return ret;
 
 	fap->debugfs = debugfs_create_dir(dev_name(dev), NULL);
+	debugfs_create_file("state", 0400, fap->debugfs, fap, &state_fops);
 	debugfs_create_file("regs", 0400, fap->debugfs, fap, &regs_fops);
 	debugfs_create_file("log", 0400, fap->debugfs, fap, &log_fops);
 	debugfs_create_file("mbox", 0600, fap->debugfs, fap, &mbox_fops);
@@ -507,10 +586,14 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	fap_wr(fap, FAP_GP_MBOX_IN, FAP_REG_GP_MASK);
 	fap_wr(fap, FAP_IRQ_MIPS_MBOX_IN, FAP_REG_IRQ_MIPS_MASK);
 
+	fap->state = FAP_IDLE;
+
 	/* the image must be in memory before the 4KE fetches it */
 	wmb();
 	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) & ~FAP_SOFT_RESET_4KE,
 	       FAP_REG_SOFT_RESETS);
+
+	schedule_delayed_work(&fap->watchdog, msecs_to_jiffies(FAP_WATCHDOG_MS));
 
 	dev_info(dev, "4KE started from %s, memory at %pad\n", firmware,
 		 &fap->mem_dma);

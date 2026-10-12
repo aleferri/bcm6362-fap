@@ -39,13 +39,17 @@ unsigned int bench_alu(volatile unsigned int *p, unsigned int iters);
 unsigned int bench_load(volatile unsigned int *p, unsigned int iters);
 unsigned int bench_store(volatile unsigned int *p, unsigned int iters);
 
-extern char _stack_bottom[];
+extern char _dspram_end[], _stack_bottom[];
 
 static volatile struct fap_shared *const shared =
 	(volatile struct fap_shared *)KSEG1(FAP_4KE_BOOT_BASE + FAP_SHARED_OFFSET);
 
 /* a DDR word for the access timings, the image block is in DDR */
 static volatile unsigned int ddr_word;
+
+/* main loop iterations, the timer turns them into the heartbeat */
+static volatile unsigned int main_loops __attribute__((section(".dspram")));
+static unsigned int main_loops_seen __attribute__((section(".dspram")));
 
 static unsigned int reg_rd(unsigned int off)
 {
@@ -139,7 +143,12 @@ static void irq_timer(void)
 		shared->timer_lat_min = lat;
 	if (lat > shared->timer_lat_max)
 		shared->timer_lat_max = lat;
-	shared->heartbeat++;
+
+	/* a live core is not enough, the main loop has to be moving */
+	if (main_loops != main_loops_seen) {
+		main_loops_seen = main_loops;
+		shared->heartbeat++;
+	}
 
 	/* keeps the mailbox alive if its interrupt never shows up */
 	if (reg_rd(FAP_REG_GP_STATUS) & FAP_GP_MBOX_OUT) {
@@ -210,17 +219,21 @@ static unsigned int mem_pattern_count(volatile unsigned int *mem,
 	return count;
 }
 
-/* start.S mapped the DSPRAM, the stack at its top is left alone */
+/*
+ * start.S mapped the DSPRAM; the variables at its bottom and the stack at
+ * its top are left alone.
+ */
 static int dspram_test(void)
 {
+	unsigned int start = (unsigned int)_dspram_end - KSEG0(0);
 	unsigned int words = ((unsigned int)_stack_bottom -
-			      KSEG0(DSPRAM_BASE)) / 4;
+			      (unsigned int)_dspram_end) / 4;
 	unsigned int errors, leaked;
 
 	log_reg("dspram tag0", dspram_load_tag(0));
 	log_reg("dspram tag1", dspram_load_tag(SPRAM_TAG_STRIDE));
 
-	errors = mem_test((volatile unsigned int *)KSEG0(DSPRAM_BASE), words);
+	errors = mem_test((volatile unsigned int *)KSEG0(start), words);
 
 	/*
 	 * Without the scratchpad the same physical range goes through the
@@ -228,8 +241,7 @@ static int dspram_test(void)
 	 * shows at FAP_4KE_BOOT_BASE.
 	 */
 	leaked = mem_pattern_count((volatile unsigned int *)
-				   KSEG1(FAP_4KE_BOOT_BASE + DSPRAM_BASE),
-				   words);
+				   KSEG1(FAP_4KE_BOOT_BASE + start), words);
 
 	log_reg("dspram errors", errors);
 	log_reg("dspram words in ddr", leaked);
@@ -252,7 +264,7 @@ static int local_mem_test(const char *name, unsigned int addr,
 static void bench(void)
 {
 	static volatile unsigned int *const target[FAP_BENCH_NR] = {
-		[FAP_BENCH_DSPRAM] = (volatile unsigned int *)KSEG0(DSPRAM_BASE),
+		[FAP_BENCH_DSPRAM] = &main_loops,
 		[FAP_BENCH_PSM] = (volatile unsigned int *)FAP_4KE_PSM,
 		[FAP_BENCH_QSM] = (volatile unsigned int *)FAP_4KE_QSM,
 		[FAP_BENCH_REGS] = (volatile unsigned int *)
@@ -297,6 +309,8 @@ void fap_main(void)
 	unsigned int ready = 0;
 
 	reg_wr(FAP_REG_GP_STATUS, FAP_GP_MBOX_OUT);
+	main_loops = 0;
+	main_loops_seen = 0;
 	shared->magic = FAP_SHARED_MAGIC;
 	shared->count_res = count_res();
 
@@ -323,5 +337,5 @@ void fap_main(void)
 	log_reg("gp mask", reg_rd(FAP_REG_GP_MASK));
 
 	for (;;)
-		;
+		main_loops++;
 }

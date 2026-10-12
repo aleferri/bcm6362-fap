@@ -86,15 +86,44 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - how the 4KE reaches the ENETSW iuDMA registers and SRAM (to be derived from the stock 4KE code);
 - the QSM over UBUS from the host side, verifiable with the next flash.
 
+## Operating model
+
+When the FAP is active it is the only owner of the ENETSW iuDMA. Since a
+stuck FAP would then take the whole network down, the rest of the system
+never depends on it:
+
+1. the FAP boots with the driver and stays idle: it runs, posts its
+   heartbeat and answers the mailbox, and touches nothing outside its own
+   block;
+2. the system behaves as if it did not exist: the enetsw driver keeps the
+   iuDMA until the FAP is activated by hand or by a script;
+3. the heartbeat only advances if the firmware main loop does, so a core
+   spinning in interrupts or stuck in a loop stops it;
+4. the host checks at low frequency the heartbeat and, while the FAP is
+   active, its packet progress: if there is work pending (filled RX
+   descriptors, host packets queued for TX) and the FAP counters did not
+   move, or they diverge (packets taken in but neither transmitted nor
+   handed to the host), the host deactivates the FAP. An idle link moves
+   nothing and is fine.
+
+Deactivation, by hand or by the watchdog, gives the iuDMA back to the
+host driver, which keeps working without offload. A FAP that stalls or
+faults is also held in reset, with its log kept for inspection.
+
 ## Offload plan
 
 | Phase | Content | Exit criterion | Status |
 |---|---|---|---|
 | 0 | Loader, boot, mailbox, log, memory tests | The 4KE runs and talks to the host | done |
-| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer) | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | implemented, to be run on hardware |
+| 1 | Characterization: frequency from the CP0 Count register, latencies of registers, PSM, QSM and DDR, stack in DSPRAM, interrupts on the 4KE (mailbox and timer). Heartbeat from the main loop, host watchdog holding a stalled 4KE in reset | The cycle budget per packet, and hence whether 700–800 Mbit/s is realistic | implemented, to be run on hardware |
 | 2 | Host–FAP transport: DQM queues in QSM with a "not empty" interrupt. Alternatively, our own rings in PSM | A ping that goes through the queues instead of the mailbox | |
-| 3 | Passthrough: the FAP takes the ENETSW iuDMA RX and TX channels, RX routed to the FAP, the host receives and transmits through the queues | The router works entirely through the FAP. TX completions with interrupts, so the timer is no longer needed | |
-| 4 | Flow offload: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
+| 3 | Activation: on an activation command the enetsw driver stops its iuDMA channels and the FAP takes RX and TX, with the RX interrupts routed to the FAP; the host receives and transmits through the queues. On deactivation, or when the watchdog trips on packet progress, the host takes the channels back and the FAP returns idle. Only the test bench for phase 4, never a default | Activation and deactivation under traffic with the network still working afterwards; a firmware forced to stall or fault gives the network back to the host within one watchdog period | |
+| 4 | Flow offload, the FAP in control: nf_flowtable with ndo_setup_tc(TC_SETUP_FT) on the enetsw conduit, which DSA already forwards. Flow table in PSM. The FAP does the 5-tuple lookup, NAT rewrite, TTL, incremental checksum update, port tag, and transmits directly; the rest goes to the host as in phase 3. Statistics and expirations go back to the host | Routing throughput with NAT and host CPU load, with and without offload | |
+
+Today the enetsw driver reclaims transmitted descriptors in its NAPI
+poll, which on the 6362 only the RX interrupt schedules, since the ENETSW
+has no TX interrupt lines. With the FAP owning TX, completions can reach
+the host through the queues.
 
 ## Phase 1: characterization
 
@@ -112,9 +141,15 @@ The firmware now:
   are recorded; lines firing for no known reason are masked and recorded.
   The timer also polls the mailbox, so pings keep working if the FAP
   interrupt never arrives, and the counters tell the two paths apart;
-- waits for the host to take each message before writing the next one.
+- waits for the host to take each message before writing the next one;
+- counts its main loop iterations in DSPRAM; the timer posts a heartbeat
+  only if they moved since the previous tick.
 
-The host side answers pings synchronously and adds two debugfs files.
+The host side boots the firmware at probe and leaves it idle, holds the
+4KE in reset when the heartbeat stalls for a second or the 4KE reports an
+exception, answers pings synchronously and adds the `state`, `clock` and
+`stats` debugfs files. The log and the statistics stay readable after the
+watchdog has stopped the core.
 
 ### Running it on OpenWrt
 
@@ -124,11 +159,15 @@ Build the package (`make package/bcm6362-fap/compile`), install
 ```
 insmod bcm6362-fap
 cd /sys/kernel/debug/11001000.coprocessor
+cat state          # idle
 cat log
 cat clock          # takes one second
 echo 0x1234 > mbox
 cat stats
 ```
+
+`state` reads `crashed` after the watchdog stopped the core; the reason
+is in the kernel log.
 
 What to read:
 
@@ -137,7 +176,8 @@ What to read:
 - `clock`: Count rate and core frequency, measured against the host clock
   across two pings one second apart.
 - `stats`:
-  - `heartbeat` should grow by Count rate / `FAP_TIMER_PERIOD` per second;
+  - `heartbeat` should grow by Count rate / `FAP_TIMER_PERIOD` per second
+    while the main loop runs;
   - `timer latency` is the time from the Compare match to the handler, in
     Count ticks: the interrupt entry cost;
   - `mbox irq` growing means the mailbox interrupt works and `irq lines`
@@ -164,7 +204,9 @@ register and DDR accesses fit in there.
   translating 4KE addresses, the log as a trace buffer from a resource
   table in the firmware. The mailbox becomes a mailbox controller for
   whatever sits on top (the offload driver). The characterization in
-  debugfs stays out of tree.
+  debugfs stays out of tree. remoteproc boots the core at probe with
+  `auto_boot`, and the watchdog reports through `rproc_report_crash()`;
+  activation and deactivation belong to the offload driver on top.
 - A `brcm,bcm6362-fap` YAML binding, and the node added to
   `arch/mips/boot/dts/brcm/bcm6362.dtsi`. The clock, reset and power
   domain constants are already upstream.

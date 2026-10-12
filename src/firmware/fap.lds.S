@@ -17,6 +17,13 @@ _stack_bottom = _stack_top - FAP_STACK_SIZE;
 
 SECTIONS
 {
+	/* variables kept in the DSPRAM, not initialized by the startup */
+	.dspram KSEG0(DSPRAM_BASE) (NOLOAD) : {
+		*(.dspram)
+		. = ALIGN(4);
+		_dspram_end = .;
+	}
+
 	.vectors KSEG0(FAP_4KE_BOOT_BASE) : {
 		KEEP(*(.vec.reset))
 		. = 0x180;
@@ -46,6 +53,7 @@ SECTIONS
 
 	ASSERT(_bss_end <= KSEG0(FAP_4KE_BOOT_BASE + FAP_SHARED_OFFSET),
 	       "firmware overlaps the shared area")
+	ASSERT(_dspram_end <= _stack_bottom, "DSPRAM variables overlap the stack")
 
 	/DISCARD/ : {
 		*(.reginfo .MIPS.abiflags .MIPS.options .pdr .comment .note.*)
