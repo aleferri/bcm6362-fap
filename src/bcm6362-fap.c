@@ -502,6 +502,33 @@ static int iudma_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(iudma);
 
+/* can the 4KE read DDR at host physical addresses, outside its windows? */
+static int ddr_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+	u32 load;
+	int ret;
+
+	mutex_lock(&fap->lock);
+	ret = bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_PROBE_DDR,
+					    fap->mem_dma >> 16), NULL, NULL);
+	mutex_unlock(&fap->lock);
+	if (ret)
+		return ret;
+
+	/* pairs with the sync the firmware issues before the pong */
+	rmb();
+
+	load = bench_centicycles(fap, READ_ONCE(fap->shared->ddr_direct_load));
+	seq_printf(s, "magic at %pad: 0x%08x, expected 0x%08x\n",
+		   &fap->mem_dma, READ_ONCE(fap->shared->ddr_direct_magic),
+		   FAP_SHARED_MAGIC);
+	seq_printf(s, "cycles per load %u.%02u\n", load / 100, load % 100);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ddr);
+
 /*
  * Host access timings on one word of each target, in hundredths of a ns
  * per access, both with plain loads and stores and with the MMIO
@@ -706,6 +733,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("clock", 0400, fap->debugfs, fap, &clock_fops);
 	debugfs_create_file("stats", 0400, fap->debugfs, fap, &stats_fops);
 	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
+	debugfs_create_file("ddr", 0400, fap->debugfs, fap, &ddr_fops);
 	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
 			    &hostbench_fops);
 	if (fap->qsm)

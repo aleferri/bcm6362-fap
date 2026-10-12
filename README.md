@@ -108,6 +108,9 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - DQM semantics beyond the header structs;
 - the cost of stores to the iuDMA, and whether the iuDMA can use descriptors in QSM, as the stock firmware does for ENET RX;
 - the cost of host accesses to QSM and PSM over UBUS;
+- whether the 4KE reaches DDR at host physical addresses outside the two
+  translator windows. Packet buffers can be anywhere in RAM, and both
+  translators are taken by the image block;
 - the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
 
 ## Operating model
@@ -206,7 +209,9 @@ The firmware now:
   through kseg1 (controller configuration, configuration and ring start
   of channels 0 and 1) and times loads of a register and of the state
   RAM; it also reads the per port RX channel map of the internal switch.
-  It only reads: the enetsw and b53 drivers own those blocks.
+  It only reads: the enetsw and b53 drivers own those blocks;
+- on another host command, reads its own shared area at the host physical
+  address of the block, outside the translator windows, and times it.
 
 The host side boots the firmware at probe and leaves it idle, holds the
 4KE in reset when the heartbeat stalls for a second or the 4KE reports an
@@ -230,6 +235,7 @@ cat stats
 cat iudma
 devmem 0x1000d800; devmem 0x1000da00; devmem 0x1000dc00
 cat hostbench
+cat ddr
 ```
 
 `hostbench` times host loads and stores on the FAP scratch register, QSM,
@@ -266,6 +272,9 @@ What to read:
     alternating between two distant words.
 - `iudma`: the last line is the switch RX channel map of ports 0 to 8, as
   left by the switch reset and the b53 driver.
+- `ddr`: the magic read back means the 4KE reaches any DDR address
+  directly. Like `iudma`, a wrong guess shows up as an exception or a
+  watchdog stop, so run it last.
 
 ### From the measurements to the budget
 

@@ -313,10 +313,29 @@ static void iudma_probe(void)
 		shared->iudma.switch_rx_map[port] = rx_map[port];
 }
 
+/*
+ * Reads the shared area at its host physical address, outside both
+ * translator windows: does the 4KE reach any DDR address directly?
+ */
+static void ddr_probe(unsigned int block)
+{
+	volatile unsigned int *magic = (volatile unsigned int *)
+		KSEG1((block << 16) + FAP_SHARED_OFFSET);
+
+	shared->ddr_direct_magic = *magic;
+	shared->ddr_direct_load = bench_load(magic, FAP_BENCH_ITERS);
+}
+
 static void run_command(unsigned int cmd)
 {
-	if (FAP_MSG_TYPE(cmd) == FAP_CMD_PROBE_IUDMA)
+	switch (FAP_MSG_TYPE(cmd)) {
+	case FAP_CMD_PROBE_IUDMA:
 		iudma_probe();
+		break;
+	case FAP_CMD_PROBE_DDR:
+		ddr_probe(FAP_MSG_VALUE(cmd));
+		break;
+	}
 
 	mbox_pong(cmd);
 }

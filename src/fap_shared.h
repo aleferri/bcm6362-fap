@@ -51,6 +51,7 @@
 
 #define FAP_CMD_PING		0
 #define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
+#define FAP_CMD_PROBE_DDR	2	/* value: host address of the block >> 16 */
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -117,6 +118,10 @@ struct fap_shared {
 	struct fap_bench bench[FAP_BENCH_NR];
 	unsigned int bench_ddr_far[2];	/* load ticks, see FAP_BENCH_DDR_FAR */
 	struct fap_iudma iudma;
+
+	/* the shared area read at its host physical address, untranslated */
+	unsigned int ddr_direct_magic;
+	unsigned int ddr_direct_load;	/* benchmark ticks */
 
 	char log[FAP_LOG_SIZE];
 };
