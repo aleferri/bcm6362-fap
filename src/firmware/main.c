@@ -53,6 +53,12 @@ static volatile unsigned int ddr_word;
 static volatile unsigned int main_loops __attribute__((section(".dspram")));
 static unsigned int main_loops_seen __attribute__((section(".dspram")));
 
+/* in PSM, the single descriptor of the transmit test */
+struct iudma_desc {
+	unsigned int status_len;	/* status in the high half */
+	unsigned int addr;
+};
+
 /* host command left by the interrupt handler for the main loop */
 static volatile unsigned int command __attribute__((section(".dspram")));
 
@@ -65,10 +71,13 @@ static struct {
 	unsigned int window;		/* kseg1 address of host address 0 */
 	volatile unsigned int *comp;
 	unsigned int len;
+	unsigned int period;
+	unsigned int next;		/* CP0 Count of the next frame */
 	unsigned int free_cons;
 	unsigned int comp_prod;
 	unsigned int idle_free;
 	unsigned int idle_ring;
+	unsigned int busy;
 } rx __attribute__((section(".dspram")));
 
 static unsigned int reg_rd(unsigned int off)
@@ -359,6 +368,7 @@ static void rx_publish(void)
 	shared->rx.frames = rx.comp_prod;
 	shared->rx.idle_free = rx.idle_free;
 	shared->rx.idle_ring = rx.idle_ring;
+	shared->rx.busy_ticks = rx.busy;
 }
 
 static void rx_start(void)
@@ -366,6 +376,9 @@ static void rx_start(void)
 	rx.window = KSEG1(shared->rx.ram_window);
 	rx.comp = (volatile unsigned int *)(rx.window + shared->rx.comp_ring);
 	rx.len = shared->rx.frame_len;
+	rx.period = shared->rx.period;
+	rx.next = read_c0(CP0_COUNT, 0);
+	rx.busy = 0;
 	rx.free_cons = 0;
 	rx.comp_prod = 0;
 	rx.idle_free = 0;
@@ -386,12 +399,21 @@ static void rx_stop(void)
 /* fills free buffers, as the iuDMA will, and hands them to the host */
 static void rx_step(void)
 {
-	unsigned int n, i;
+	unsigned int n, i, t0;
 
+	if (rx.period && (int)(read_c0(CP0_COUNT, 0) - rx.next) < 0)
+		return;
+
+	t0 = read_c0(CP0_COUNT, 0);
 	for (n = 0; n < RX_BATCH; n++) {
 		volatile unsigned int *buf;
 		unsigned int addr;
 
+		if (rx.period) {
+			if ((int)(read_c0(CP0_COUNT, 0) - rx.next) < 0)
+				break;
+			rx.next += rx.period;
+		}
 		if (rx.free_cons == rxq->free_prod) {
 			rx.idle_free++;
 			break;
@@ -419,12 +441,54 @@ static void rx_step(void)
 	if (!n)
 		return;
 
+	rx.busy += read_c0(CP0_COUNT, 0) - t0;
 	rx_publish();
 	if (rxq->irq_armed) {
 		rxq->irq_armed = 0;
 		shared->rx.notifies++;
 		mbox_send(FAP_MSG_RX, 0);
 	}
+}
+
+/*
+ * Drives one iuDMA TX channel the host does not use. A frame indexed to
+ * the router's own MAC comes back through the switch, so the host sees it
+ * arrive; here we only check the engine took the descriptor.
+ */
+static void tx_test(void)
+{
+	volatile unsigned int *dma = (volatile unsigned int *)KSEG1(ENETSW_DMA);
+	volatile struct iudma_desc *desc = (volatile struct iudma_desc *)
+		(FAP_4KE_PSM + FAP_TX_DESC_PSM_OFFSET);
+	unsigned int ch = shared->tx.channel;
+	volatile unsigned int *cfg, *sram;
+	unsigned int start, waited;
+
+	cfg = &dma[(IUDMA_CHANNELS + ch * IUDMA_CH_STRIDE) / 4];
+	sram = &dma[(IUDMA_SRAM + ch * IUDMA_CH_STRIDE) / 4];
+
+	desc->addr = shared->tx.buf;
+	desc->status_len = ((DMA_OWN | DMA_SOP | DMA_EOP | DMA_WRAP |
+			     shared->tx.append) << 16) | shared->tx.len;
+	__asm__ volatile("sync" ::: "memory");
+
+	/* point the channel at the descriptor in PSM and start it */
+	sram[IUDMA_SRAM_DESC_LO / 4] = FAP_PSM_HOST_BASE + FAP_TX_DESC_PSM_OFFSET;
+	start = read_c0(CP0_COUNT, 0);
+	cfg[IUDMA_CH_FLOWCTL / 4] = IUDMA_EN;
+	shared->tx.kick_ticks = read_c0(CP0_COUNT, 0) - start;
+
+	start = read_c0(CP0_COUNT, 0);
+	do {
+		waited = read_c0(CP0_COUNT, 0) - start;
+		if (waited > 100 * FAP_TIMER_PERIOD) {
+			shared->tx.done_ticks = 0;
+			goto out;
+		}
+	} while (desc->status_len & (DMA_OWN << 16));
+	shared->tx.done_ticks = waited;
+out:
+	shared->tx.status = desc->status_len >> 16;
 }
 
 static void run_command(unsigned int cmd)
@@ -444,6 +508,9 @@ static void run_command(unsigned int cmd)
 		break;
 	case FAP_CMD_RX_STOP:
 		rx_stop();
+		break;
+	case FAP_CMD_TX_TEST:
+		tx_test();
 		break;
 	}
 

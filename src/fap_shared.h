@@ -60,6 +60,7 @@
 #define FAP_CMD_PEEK		3	/* reads the word at fap_shared.peek_addr */
 #define FAP_CMD_RX_START	4	/* setup in fap_shared.rx and fap_rx_qsm */
 #define FAP_CMD_RX_STOP		5
+#define FAP_CMD_TX_TEST		6	/* setup in fap_shared.tx */
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -105,6 +106,22 @@
 /* the header the 4KE writes in each buffer, numbered frame after frame */
 #define FAP_RX_PATTERN_WORDS	16
 #define FAP_RX_PATTERN(seq, i)	((seq) * FAP_RX_PATTERN_WORDS + (i))
+
+/*
+ * Transmit test: the 4KE drives one iuDMA TX channel the host does not
+ * use, with a single descriptor in PSM, and reports whether the engine
+ * took the frame (OWN cleared). The host fills the buffer and reads the
+ * result; it owns nothing else of that channel.
+ */
+#define FAP_TX_DESC_PSM_OFFSET	0x100	/* past the receive rings */
+
+/* iuDMA descriptor, big-endian: status in the high half, length in the low */
+#define DMA_OWN			0x8000
+#define DMA_EOP			0x4000
+#define DMA_SOP			0x2000
+#define DMA_WRAP		0x1000
+#define DMA_APPEND_BRCM_TAG	0x0200
+#define DMA_APPEND_CRC		0x0100
 
 #ifndef __ASSEMBLER__
 enum fap_bench_target {
@@ -165,12 +182,26 @@ struct fap_shared {
 		unsigned int ram_window;	/* 4KE address of host address 0 */
 		unsigned int comp_ring;		/* host address */
 		unsigned int frame_len;
+		unsigned int period;		/* CP0 Count ticks between frames, 0 = as fast as possible */
 		/* written by the 4KE */
 		unsigned int frames;
 		unsigned int notifies;
 		unsigned int idle_free;		/* passes without free buffers */
 		unsigned int idle_ring;		/* passes with the ring full */
+		unsigned int busy_ticks;	/* CP0 Count spent filling frames */
 	} rx;
+
+	struct fap_tx {
+		/* set by the host before FAP_CMD_TX_TEST */
+		unsigned int channel;		/* iuDMA channel index */
+		unsigned int buf;		/* host address of the frame */
+		unsigned int len;
+		unsigned int append;		/* DMA_APPEND_* flags */
+		/* written by the 4KE */
+		unsigned int kick_ticks;	/* CP0 Count to start the engine */
+		unsigned int done_ticks;	/* until OWN cleared, 0 if stuck */
+		unsigned int status;		/* descriptor status read back */
+	} tx;
 
 	char log[FAP_LOG_SIZE];
 };

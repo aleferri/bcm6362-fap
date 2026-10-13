@@ -387,19 +387,51 @@ The test stands in for phase 3: the 4KE writes a numbered 64 byte header
 in each buffer, where the iuDMA will write whole frames, and reports a
 1514 byte frame. The host checks each header and the numbering.
 
+`echo start > rxtest` runs as fast as the host drains; `echo start N >
+rxtest` caps the 4KE at N frames/s, which exercises the notification
+path and gives a steady host CPU figure. A rate needs the Count
+frequency, so read `clock` once first.
+
 ```
 cd /sys/kernel/debug/11001000.coprocessor
-echo start > rxtest; sleep 10; cat rxtest; echo stop > rxtest
-cat rxtest
-cat stats
+cat clock
+for r in 80000 200000 0; do
+  echo start $r > rxtest; sleep 5; cat rxtest; echo stop > rxtest
+done
 ```
 
 `rxtest` shows on the host side the frames received, header errors,
 numbering gaps and bad entries, the frame rate and the share of one CPU
 spent in the work item; on the 4KE side the frames posted, the
-notifications and how often it found no free buffer or a full ring.
-After a run the `qsm` file no longer matches the test pattern, since the
-rings live there.
+notifications, how often it found no free buffer or a full ring, and the
+cycles it spent per frame. At a capped rate the notifications should
+track the frames, not stay at 1. After a run the `qsm` file no longer
+matches the test pattern, since the rings live there.
+
+## Phase 3: driving the iuDMA
+
+The first step is the 4KE driving one iuDMA TX channel the host does not
+use. With the host on logical channel 0 (iuDMA 0 and 1), channel 3 (the
+TX of logical channel 1) is free. The 4KE writes a single descriptor in
+PSM, as the stock keeps the FAP descriptors there, points the channel at
+it and starts it, then polls the ownership bit:
+
+```
+cat txtest
+```
+
+It reports whether the engine cleared OWN, and the cycles the start and
+the completion took. This is the first time the FAP drives the iuDMA
+rather than reading it; the frame is zeroed and not meant to leave the
+switch yet. Giving it the router's own address and the appended Broadcom
+tag, so it comes back in and the host sees it, and routing the TX DMA
+interrupt to the FAP through `miscExtra2FapIrqMask` (0xb0001840, bit 1
+for TX DMA 1), come next.
+
+The ENETSW TX DMA interrupts only reach the FAP, never the host
+(`extra2ChipIrqStatus`, routed by `miscExtra2FapIrqMask` at
+MISC_BASE + 0x40); the RX DMA interrupts reach the host and can also be
+routed to the FAP through `miscExtraFapIrqMask` at + 0x3c. [SDK]
 
 ## Upstream
 

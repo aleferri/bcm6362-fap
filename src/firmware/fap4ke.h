@@ -15,12 +15,23 @@
 #define FAP_4KE_REGS		0xe0001000
 #define FAP_4KE_QSM		0xe0004000
 #define FAP_4KE_PSM		0xe0010000
+/* the same PSM as the iuDMA (and the host) address it */
+#define FAP_PSM_HOST_BASE	0x11010000
 
 /* ENETSW iuDMA, at its host physical address */
 #define ENETSW_DMA		0x1000d800
 #define IUDMA_CHANNELS		0x200
 #define IUDMA_SRAM		0x400
 #define IUDMA_CH_STRIDE		0x10
+#define IUDMA_CH_FLOWCTL	0x0	/* DmaChannelCfg: enable, flowc */
+#define  IUDMA_EN		0x1
+#define  IUDMA_PKTHALT		0x2
+#define  IUDMA_BURSTHALT	0x4
+#define IUDMA_SRAM_DESC_LO	0x8	/* DmaStateRam: ring base */
+
+/* internal switch, CPU port queue to iuDMA channel map */
+#define ENETSW_SWITCH		0x10e00000
+#define SWITCH_IUDMA_QCTRL	0x000000ac
 
 /* data scratchpad, at the physical address the SDK firmware uses */
 #define DSPRAM_BASE		0x4000
