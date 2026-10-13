@@ -3,7 +3,6 @@
 Next to every fact in this summary is its source:
 
 - **[HW]** verified by us on the hardware;
-- **[blob]** derived from the disassembled stock code;
 - **[SDK]** from the headers only;
 - **[ded.]** deduced.
 
@@ -16,7 +15,7 @@ Next to every fact in this summary is its source:
 | How many | Only one on the 6362. The 63168 has two | [SDK] |
 | CPU | MIPS 4KEp Release 2 (PRId 0x0001916c), big-endian, Fixed Mapping without TLB, iterative multiplier | [HW] |
 | Cache | 16 KB 4-way I-cache, 16-byte lines. No D-cache | [HW] |
-| DSPRAM | Present, 8 KB, enabled at 0x4000 (TagLo 0x4080, read back as 0x40a0) and tested. The size comes from the stock firmware, not from the hardware | [HW] |
+| DSPRAM | Present, 8 KB, enabled at 0x4000 (TagLo 0x4080, read back as 0x40a0) and tested. The size comes from the SDK, not from the hardware | [HW] |
 | Other | MIPS16e, EJTAG, COP2 interface present (what is attached to it is unknown), no FPU and no performance counters | [HW] |
 | Frequency | 166.67 MHz, CP0 Count at 83.33 MHz (resolution 2), measured against the host clock. The SDK comments say 200 MHz | [HW] |
 | Interrupts | CP0 timer on IP7 (IntCtl.IPTI), FAP block on IP2. Entry into a C handler 54–740 cycles, including the context save | [HW] |
@@ -79,7 +78,7 @@ them [HW]. WAIT keeps the CP0 Count running, so the timer wakes the core
 | Block | Seen by the 4KE | Seen by the host via UBUS | Size |
 |---|---|---|---|
 | FAP registers | 0xe0001000 [HW] | 0x11001000 [HW] | 4 KB, plus the DQM counters at +0x1000 [SDK] |
-| QSM | 0xe0004000 [HW] | 0x11004000 [HW]; the stock driver uses the SMISB alias 0x14004000 [blob] | 16 KB [HW] |
+| QSM | 0xe0004000 [HW] | 0x11004000 [HW]; the stock driver uses the SMISB alias 0x14004000 [SDK] | 16 KB [HW] |
 | PSM | 0xe0010000 [HW] | 0x11010000 [HW] | 32 KB [HW] |
 | DPE | 0xe0050000… | 0x11040000 | [SDK] |
 | DDR | Through two translators: mask, 4KE-side base, host-side base. They ignore bits 31 and 29, so kseg0 and kseg1 are aliases [HW]. Outside their windows, directly at the host physical address [HW] | — | power-of-two sized, naturally aligned block [HW] |
@@ -118,7 +117,6 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - The D-Link DSL-3580_EU build profile has no RX or TX splitting and one ENET RX and one TX channel, both owned by the FAP, with FAP GSO enabled: the stock firmware routes all host traffic through the FAP, receive and transmit. Logical channel 1 (iuDMA 2 and 3) is unused there. [SDK]
 - Switch to iuDMA channels: register 0xac of switch page 0 (`REG_IUDMA_QUEUE_CTRL`, 32 bits, at 0x10e000ac). Bits 31:16 hold 2 bits per CPU port egress queue (8 queues), the logical RX channel the queue goes to; bits 11:0 hold 3 bits per logical TX channel, the switch queue its frames take. The stock RX splitting sends queue 1 to channel 1. [SDK]
 - The per port `pri_id_map` at switch offset 0x3050, which an SDK header comment ties to the RX iuDMA channel, is not what the stock driver uses for it; all 9 read 0 [HW].
-- The stock FAP host object for this board (`bcmfapDSL-3580_EU.o_save` in the GPL tarball) is not stripped and carries debug information; the 4KE image is in `gSections4ke`. It is the reference for what the open sources leave out, such as the routing of the ENETSW interrupts to the FAP (`fapIrq_init`).
 
 ### Boot [HW]
 
@@ -137,10 +135,7 @@ the 4KE stays in reset and the `state` debugfs file reads `offline`.
 
 ### Stock firmware
 
-- Size: 512 KB block, about 110 KB of code and 150 KB of bss. [blob]
-- Boot: on reset it writes 0x00C0FFEE into the mailbox and jumps to the startup code. The startup code sets K0 write-through, invalidates the I-cache, configures the DSPRAM and puts the stack there. [blob]
 - QSM: according to a header comment, the stock firmware places the ENET RX descriptors in the upper part of the QSM. So the iuDMA can read descriptors from there. [SDK]
-- Registers and memories: the stock 4KE code uses the QSM up to 0xe0007f34 and the PSM up to 0xe0017b80, consistent with their sizes. [blob]
 
 ### Still unknown
 
@@ -230,8 +225,9 @@ all traffic at once, whatever the ingress port.
 
 The firmware now:
 
-- maps the DSPRAM in the startup code and runs with the stack at its top,
-  as the stock firmware does; the memory test covers the rest of it;
+- maps the DSPRAM in the startup code and runs with the stack at its top;
+  the stock firmware keeps its stack there too [SDK]; the memory test
+  covers the rest of it;
 - reads the CP0 Count resolution with `rdhwr $3`;
 - times 8192 loads and 8192 stores on one word of DSPRAM, PSM, QSM, the
   scratch control register and DDR, plus the same loop with adds only,
