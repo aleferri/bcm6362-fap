@@ -6,8 +6,10 @@
  * placed in a host memory block that the FAP address translators map both at
  * the 4KE reset vector and at 4KE physical address 0 (exception vectors).
  *
- * The firmware boots with the driver and stays idle. A watchdog holds the
- * 4KE in reset if its heartbeat stalls or it reports an exception.
+ * The firmware is requested asynchronously, so the driver does not need it
+ * at probe time: the 4KE boots once it shows up in /lib/firmware and stays
+ * in reset if it never does. Once running, it stays idle; a watchdog holds
+ * it in reset if its heartbeat stalls or it reports an exception.
  */
 
 #include <linux/cleanup.h>
@@ -105,6 +107,8 @@ struct bcm6362_fap {
 
 	u16 ping_seq;
 	struct completion pong;
+	/* completed once the firmware request has been answered */
+	struct completion fw_done;
 	u32 pong_msg;
 	ktime_t pong_time;
 
@@ -148,28 +152,6 @@ static void bcm6362_fap_map(struct bcm6362_fap *fap, unsigned int reg,
 	fap_wr(fap, ~((size - 1) | FAP_ADDR_IGNORE), reg + FAP_ADDR_MASK);
 	fap_wr(fap, fap_base, reg + FAP_ADDR_BASE_IN);
 	fap_wr(fap, host_base, reg + FAP_ADDR_BASE_OUT);
-}
-
-static int bcm6362_fap_load(struct bcm6362_fap *fap)
-{
-	const struct firmware *fw;
-	int ret;
-
-	ret = request_firmware(&fw, firmware, fap->dev);
-	if (ret)
-		return ret;
-
-	if (fw->size > FAP_SHARED_OFFSET) {
-		dev_err(fap->dev, "%s: %zu bytes, at most %u fit\n",
-			firmware, fw->size, FAP_SHARED_OFFSET);
-		ret = -EFBIG;
-	} else {
-		memcpy(fap->mem, fw->data, fw->size);
-	}
-
-	release_firmware(fw);
-
-	return ret;
 }
 
 static irqreturn_t bcm6362_fap_isr(int irq, void *data)
@@ -1043,6 +1025,65 @@ static void __iomem *bcm6362_fap_ioremap_optional(struct platform_device *pdev,
 	return devm_ioremap_resource(&pdev->dev, res);
 }
 
+static int bcm6362_fap_boot(struct bcm6362_fap *fap, const struct firmware *fw)
+{
+	lockdep_assert_held(&fap->lock);
+
+	if (fw->size > FAP_SHARED_OFFSET) {
+		dev_err(fap->dev, "%s: %zu bytes, at most %u fit\n",
+			firmware, fw->size, FAP_SHARED_OFFSET);
+		return -EFBIG;
+	}
+	memcpy(fap->mem, fw->data, fw->size);
+
+	bcm6362_fap_map(fap, FAP_REG_ADDR1, 0, fap->mem_dma, FAP_MEM_SIZE);
+	bcm6362_fap_map(fap, FAP_REG_ADDR2, FAP_4KE_BOOT_BASE, fap->mem_dma,
+			FAP_MEM_SIZE);
+
+	fap_wr(fap, FAP_GP_MBOX_IN | FAP_GP_MBOX_OUT, FAP_REG_GP_STATUS);
+	fap_wr(fap, FAP_GP_MBOX_IN, FAP_REG_GP_MASK);
+	fap_wr(fap, FAP_IRQ_MIPS_MBOX_IN, FAP_REG_IRQ_MIPS_MASK);
+
+	fap->state = FAP_IDLE;
+
+	/* the image must be in memory before the 4KE fetches it */
+	wmb();
+	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) & ~FAP_SOFT_RESET_4KE,
+	       FAP_REG_SOFT_RESETS);
+
+	schedule_delayed_work(&fap->watchdog, msecs_to_jiffies(FAP_WATCHDOG_MS));
+
+	dev_info(fap->dev, "4KE started from %s, memory at %pad\n", firmware,
+		 &fap->mem_dma);
+
+	return 0;
+}
+
+/* without a firmware the 4KE simply stays in reset */
+static void bcm6362_fap_fw_ready(const struct firmware *fw, void *context)
+{
+	struct bcm6362_fap *fap = context;
+
+	if (fw) {
+		scoped_guard(mutex, &fap->lock)
+			bcm6362_fap_boot(fap, fw);
+		release_firmware(fw);
+	} else {
+		dev_info(fap->dev, "%s not found, 4KE left in reset\n",
+			 firmware);
+	}
+
+	complete(&fap->fw_done);
+}
+
+/* on removal, before the halt: the request may still be pending */
+static void bcm6362_fap_fw_wait(void *data)
+{
+	struct bcm6362_fap *fap = data;
+
+	wait_for_completion(&fap->fw_done);
+}
+
 static void bcm6362_fap_halt(void *data)
 {
 	struct bcm6362_fap *fap = data;
@@ -1065,6 +1106,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	fap->dev = dev;
 	init_completion(&fap->pong);
+	init_completion(&fap->fw_done);
 	INIT_WORK(&fap->rx.work, bcm6362_fap_rx_work);
 
 	ret = devm_mutex_init(dev, &fap->lock);
@@ -1112,14 +1154,6 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 
 	fap->shared = fap->mem + FAP_SHARED_OFFSET;
 
-	ret = bcm6362_fap_load(fap);
-	if (ret)
-		return dev_err_probe(dev, ret, "loading %s\n", firmware);
-
-	bcm6362_fap_map(fap, FAP_REG_ADDR1, 0, fap->mem_dma, FAP_MEM_SIZE);
-	bcm6362_fap_map(fap, FAP_REG_ADDR2, FAP_4KE_BOOT_BASE, fap->mem_dma,
-			FAP_MEM_SIZE);
-
 	/* the interrupt handler kicks the watchdog on exceptions */
 	ret = devm_delayed_work_autocancel(dev, &fap->watchdog,
 					   bcm6362_fap_watchdog);
@@ -1162,23 +1196,18 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	fap_wr(fap, FAP_GP_MBOX_IN | FAP_GP_MBOX_OUT, FAP_REG_GP_STATUS);
-	fap_wr(fap, FAP_GP_MBOX_IN, FAP_REG_GP_MASK);
-	fap_wr(fap, FAP_IRQ_MIPS_MBOX_IN, FAP_REG_IRQ_MIPS_MASK);
+	/* not _or_reset: waiting here before the request would never end */
+	ret = devm_add_action(dev, bcm6362_fap_fw_wait, fap);
+	if (ret)
+		return ret;
 
-	fap->state = FAP_IDLE;
+	ret = request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT, firmware,
+				      dev, GFP_KERNEL, fap,
+				      bcm6362_fap_fw_ready);
+	if (ret)
+		complete(&fap->fw_done);
 
-	/* the image must be in memory before the 4KE fetches it */
-	wmb();
-	fap_wr(fap, fap_rd(fap, FAP_REG_SOFT_RESETS) & ~FAP_SOFT_RESET_4KE,
-	       FAP_REG_SOFT_RESETS);
-
-	schedule_delayed_work(&fap->watchdog, msecs_to_jiffies(FAP_WATCHDOG_MS));
-
-	dev_info(dev, "4KE started from %s, memory at %pad\n", firmware,
-		 &fap->mem_dma);
-
-	return 0;
+	return ret;
 }
 
 static const struct of_device_id bcm6362_fap_of_match[] = {

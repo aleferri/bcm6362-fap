@@ -129,6 +129,12 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 5. boot translator at 0x1fc00000, i.e. the reset vector;
 6. 4KE released.
 
+Steps 3 to 6 wait for the firmware: the driver requests it
+asynchronously, so it needs neither an initramfs nor the root
+filesystem at probe time. On OpenWrt the kernel falls back to procd,
+which answers from /lib/firmware once it runs; if the file is not there
+the 4KE stays in reset and the `state` debugfs file reads `offline`.
+
 ### Stock firmware
 
 - Size: 512 KB block, about 110 KB of code and 150 KB of bss. [blob]
