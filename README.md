@@ -25,20 +25,48 @@ Next to every fact in this summary is its source:
 ### Access cost
 
 Cycles per access from the 4KE, with the loop overhead taken out. Loads
-are followed by an instruction using the loaded value. Every access hits
-the same word, so the DDR figure is a best case with the row already open.
+are followed by an instruction using the loaded value.
 
 | Target | Load | Store |
 |---|---|---|
 | DSPRAM | 2 | 1 |
 | PSM, QSM | 7 | 4.6 |
 | FAP control registers | 6 | 6.6 |
-| DDR | 30.6 | 7.6 |
+| DDR through a translator, same word | 30.6 | 7.6 |
+| DDR through a translator, alternating words 4 KB or 32 KB apart | 59 | not measured |
+| DDR at its host physical address, same word | 56 | not measured |
 | ENETSW iuDMA registers | 42 | not measured |
 | ENETSW iuDMA state RAM | 43 | not measured |
+| Integrated WLAN core registers, single load | about 64 | not measured |
+| PCIe memory window, single load | about 230 | not measured |
 
 Source: [HW], phase 1 benchmark. Stores go through the write buffer.
 The iuDMA is only read, since the enetsw driver owns it.
+
+Through the translators a DDR row change costs about 28 cycles more. The
+4KE also reaches DDR directly at its host physical address, outside the
+translator windows, but even without leaving the row that path costs
+about as much as a row change through a window [HW]; why is unknown.
+
+Host accesses, in ns per access, plain and with the MMIO accessors,
+which on MIPS add a sync around every access [HW]:
+
+| Target | Load | Store | readl | writel |
+|---|---|---|---|---|
+| FAP registers, QSM, PSM | 186 | 72–84 | 234 | 186–198 |
+| DDR uncached | 253 | 54 | 300 | 144 |
+| DDR cached | 10 | 7.6 | 55 | 28 |
+
+The 4KE reaches the DMA engines of the integrated WLAN 802.11 core at
+0x10005200 through kseg1, with the core up (b43 holds it in reset while
+no interface is up): 64-bit engines, TX and RX enabled, rings in RAM,
+RX index moving in monitor mode [HW]. It also reaches the PCIe memory
+window at physical 0xa0000000 through kuseg at 0x60000000, as the Fixed
+Mapping MMU implies: a load from the BCM4352 BAR0 completed with the
+Broadcom backplane "dead" pattern 0xdeaddead, byte swapped, so PCIe data
+reaches the 4KE in little-endian order [HW]. That the core behind the
+window answered dead means it was not accessible, not that the path
+failed.
 
 The 4KE reaches the ENETSW iuDMA at its host physical address 0x1000d800
 through kseg1: it reads the controller enabled, RX channel 0 enabled and
@@ -54,7 +82,7 @@ them [HW]. WAIT keeps the CP0 Count running, so the timer wakes the core
 | QSM | 0xe0004000 [HW] | 0x11004000 [HW]; the stock driver uses the SMISB alias 0x14004000 [blob] | 16 KB [HW] |
 | PSM | 0xe0010000 [HW] | 0x11010000 [HW] | 32 KB [HW] |
 | DPE | 0xe0050000… | 0x11040000 | [SDK] |
-| DDR | Through two translators: mask, 4KE-side base, host-side base. They ignore bits 31 and 29, so kseg0 and kseg1 are aliases | — | power-of-two sized, naturally aligned block [HW] |
+| DDR | Through two translators: mask, 4KE-side base, host-side base. They ignore bits 31 and 29, so kseg0 and kseg1 are aliases [HW]. Outside their windows, directly at the host physical address [HW] | — | power-of-two sized, naturally aligned block [HW] |
 
 The sub-blocks inside the register space, as offsets from the base [SDK]:
 
@@ -108,10 +136,8 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - what sits on COP2;
 - DQM semantics beyond the header structs;
 - the cost of stores to the iuDMA, and whether the iuDMA can use descriptors in QSM, as the stock firmware does for ENET RX;
-- the cost of host accesses to QSM and PSM over UBUS;
-- whether the 4KE reaches DDR at host physical addresses outside the two
-  translator windows. Packet buffers can be anywhere in RAM, and both
-  translators are taken by the image block;
+- why direct DDR accesses from the 4KE cost twice those through a
+  translator window;
 - the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
 
 ## Operating model
@@ -298,14 +324,25 @@ and 140 per 64 byte frame.
 
 The budget is shared by both directions: a TCP download at 800 Mbit/s is
 about 66 kpps of data plus 33 kpps of ACKs, about 1700 cycles per packet
-on average. A forwarded packet needing some ten header loads from DDR
-(about 300 cycles), a PSM table lookup (about 150) plus descriptors and
-stores stays well under 1000 cycles, so 700–800 Mbit/s with full size
-frames looks reachable, while small frames at line rate do not. The
+on average. A forwarded packet needs some ten header loads from DDR:
+about 330 cycles through a translator window (one row change, then the
+same row), about 560 at the host physical address. With a PSM table
+lookup (about 150) plus descriptors and stores it stays under 1000
+cycles through a window, so 700–800 Mbit/s with full size frames looks
+reachable, while small frames at line rate do not. The low translator,
+freed by moving EBase, is worth mapping over the packet buffers. The
 iuDMA itself is the expensive part, over 40 cycles per load, more than
 DDR: the per packet path should read descriptor ownership from memory
 rather than the iuDMA registers, and only write to the iuDMA (channel
 kick, interrupt acknowledge).
+
+For the phase 2 queues each side should write across the bus and read
+locally. Host loads from the FAP memories cost 186 ns, and from
+uncached DDR 253 ns, against 10 ns from its cache; host stores to the
+FAP memories cost 72–84 ns, so they are worth batching. Hence the FAP to
+host queue lives in DDR, written by the 4KE and read by the host through
+its cache, and the host to FAP queue of free buffers lives in QSM or PSM,
+read by the 4KE at 7 cycles. MMIO accessors are only for doorbells.
 
 ## Upstream
 
