@@ -471,7 +471,7 @@ static int iudma_show(struct seq_file *s, void *unused)
 	struct bcm6362_fap *fap = s->private;
 	struct fap_iudma *iudma = &fap->shared->iudma;
 	u32 cmd, regs, sram;
-	int ch, port, ret;
+	int ch, ret;
 
 	mutex_lock(&fap->lock);
 	cmd = FAP_MSG(FAP_CMD_PROBE_IUDMA, ++fap->ping_seq);
@@ -494,11 +494,6 @@ static int iudma_show(struct seq_file *s, void *unused)
 	sram = bench_centicycles(fap, READ_ONCE(iudma->load_sram));
 	seq_printf(s, "cycles per load regs %u.%02u state ram %u.%02u\n",
 		   regs / 100, regs % 100, sram / 100, sram % 100);
-
-	seq_puts(s, "switch rx map  ");
-	for (port = 0; port < FAP_SWITCH_PORTS; port++)
-		seq_printf(s, " %04x", READ_ONCE(iudma->switch_rx_map[port]));
-	seq_putc(s, '\n');
 
 	return 0;
 }

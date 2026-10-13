@@ -286,16 +286,13 @@ static void bench(void)
 }
 
 /*
- * The 4KE reads the iuDMA, and the switch map choosing its RX channels, at
- * the addresses the host uses. The host drivers own them, so nothing is
- * written.
+ * The 4KE reads the iuDMA at the address the host uses. The host driver
+ * owns it, so nothing is written.
  */
 static void iudma_probe(void)
 {
 	volatile unsigned int *dma = (volatile unsigned int *)KSEG1(ENETSW_DMA);
-	volatile unsigned short *rx_map = (volatile unsigned short *)
-		KSEG1(ENETSW_SWITCH + SWITCH_RX_MAP);
-	int ch, port;
+	int ch;
 
 	shared->iudma.controller_cfg = dma[0];
 	for (ch = 0; ch < FAP_IUDMA_PROBE_CHANNELS; ch++) {
@@ -308,9 +305,6 @@ static void iudma_probe(void)
 	shared->iudma.load_regs = bench_load(dma, FAP_BENCH_ITERS);
 	shared->iudma.load_sram = bench_load(&dma[IUDMA_SRAM / 4],
 					     FAP_BENCH_ITERS);
-
-	for (port = 0; port < FAP_SWITCH_PORTS; port++)
-		shared->iudma.switch_rx_map[port] = rx_map[port];
 }
 
 /*

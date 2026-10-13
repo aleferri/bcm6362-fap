@@ -113,7 +113,12 @@ The sub-blocks inside the register space, as offsets from the base [SDK]:
 - Interrupt to the host: peripheral line 29. [HW]
 - Interrupts to the FAP: peripherals can be routed to the FAP through miscFapIrqMask, Extra and Extra2. The stock firmware routed the ENETSW RX DMAs and the SAR DMAs there. [SDK]
 - ENETSW DMA interrupts: RX 0–3 reach the host interrupt controller; TX 0–3 only exist in extra2ChipIrqStatus, which can be routed to the FAP through extra2FapIrqMask, so only the FAP can get TX completion interrupts. [SDK]
-- Switch to iuDMA RX channel: the internal switch has a 16-bit priority ID map per port (9 ports, `pri_id_map` at switch offset 0x3050), described as controlling the RX iuDMA channel. Its exact layout is unknown. [SDK]
+- iuDMA splitting: the SDK kernel configuration has "PktDma Iudma Rx Splitting" and "Tx Splitting" options, which need the FAP, and allows 1 to 4 ENET RX and TX DMA channels. The stock design already shared the iuDMA channels between host and FAP in both directions. [SDK]
+- ENET channels: logical channel n is iuDMA channel 2n for RX and 2n + 1 for TX. On the 6362 the stock driver gives logical channel 0 to the FAP and channel 1 to the host when splitting, and keeps the descriptors of the FAP channels in PSM (`ENET_RX_BDS_IN_PSM`, `ENET_TX_BDS_IN_PSM`), so the iuDMA reaches the PSM. [SDK]
+- The D-Link DSL-3580_EU build profile has no RX or TX splitting and one ENET RX and one TX channel, both owned by the FAP, with FAP GSO enabled: the stock firmware routes all host traffic through the FAP, receive and transmit. Logical channel 1 (iuDMA 2 and 3) is unused there. [SDK]
+- Switch to iuDMA channels: register 0xac of switch page 0 (`REG_IUDMA_QUEUE_CTRL`, 32 bits, at 0x10e000ac). Bits 31:16 hold 2 bits per CPU port egress queue (8 queues), the logical RX channel the queue goes to; bits 11:0 hold 3 bits per logical TX channel, the switch queue its frames take. The stock RX splitting sends queue 1 to channel 1. [SDK]
+- The per port `pri_id_map` at switch offset 0x3050, which an SDK header comment ties to the RX iuDMA channel, is not what the stock driver uses for it; all 9 read 0 [HW].
+- The stock FAP host object for this board (`bcmfapDSL-3580_EU.o_save` in the GPL tarball) is not stripped and carries debug information; the 4KE image is in `gSections4ke`. It is the reference for what the open sources leave out, such as the routing of the ENETSW interrupts to the FAP (`fapIrq_init`).
 
 ### Boot [HW]
 
@@ -180,8 +185,8 @@ A FAP that stalls or faults is also held in reset, with its log kept for
 inspection.
 
 Moving RX can be done in two ways; the second is preferred, and the
-switch per port priority map that selects the RX channel [SDK] makes it
-likely possible:
+switch register mapping its CPU port queues to RX channels [SDK] makes
+it possible:
 
 - the FAP takes over the host RX channel, which the enetsw driver stops
   on activation and restarts on deactivation;
@@ -207,10 +212,13 @@ has to be routed to the FAP with miscFapIrqMask [SDK].
 Today the enetsw driver reclaims transmitted descriptors in its NAPI
 poll, which on the 6362 only the RX interrupt schedules, since the TX
 DMA interrupts do not reach the host. With RX on the FAP, the interrupt
-the FAP raises for the phase 2 queue schedules that poll instead. On
-the DSL-3580L all LAN and WAN traffic enters the internal switch on
-port 4, so a per port map moves all of it at once, which is what RX
-delegation needs.
+the FAP raises for the phase 2 queue schedules that poll instead.
+
+With the host on logical channel 0, as the OpenWrt device tree sets it
+(iuDMA 0 and 1), the FAP takes logical channel 1 (iuDMA 2 and 3). RX
+delegation then means writing 1 to the 8 queue fields of
+`REG_IUDMA_QUEUE_CTRL`, and deactivation writing 0 back: one register,
+all traffic at once, whatever the ingress port.
 
 ## Phase 1: characterization
 
@@ -235,8 +243,7 @@ The firmware now:
 - on a host command, reads the ENETSW iuDMA at its host physical address
   through kseg1 (controller configuration, configuration and ring start
   of channels 0 and 1) and times loads of a register and of the state
-  RAM; it also reads the per port RX channel map of the internal switch.
-  It only reads: the enetsw and b53 drivers own those blocks;
+  RAM. It only reads: the enetsw driver owns the iuDMA;
 - on another host command, reads its own shared area at the host physical
   address of the block, outside the translator windows, and times it;
 - sets EBase onto the block through the boot window at boot, so that the
@@ -301,8 +308,6 @@ What to read:
   - the access table gives cycles per access; `alu` is the loop cost with
     an add in place of each load; the `ddr ... apart` lines are the loads
     alternating between two distant words.
-- `iudma`: the last line is the switch RX channel map of ports 0 to 8, as
-  left by the switch reset and the b53 driver.
 - `ddr`: the magic read back means the 4KE reaches any DDR address
   directly. Like `iudma`, a wrong guess shows up as an exception or a
   watchdog stop, so run it last.
