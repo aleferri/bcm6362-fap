@@ -19,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -35,6 +36,7 @@
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "fap_shared.h"
@@ -66,9 +68,23 @@
 #define FAP_RX_TEST_LEN		1514
 #define FAP_RX_BUDGET		64
 
-/* transmit test: an iuDMA channel the host does not use, and its length */
+/* transmit test: an iuDMA channel the host does not use */
 #define FAP_TX_TEST_CHANNEL	3	/* logical channel 1, TX */
-#define FAP_TX_TEST_LEN		64
+
+/*
+ * Broadcom tags after the source address, as DSA builds them
+ * (net/dsa/tag_brcm.c): the internal switch takes the legacy 6-byte tag on
+ * its CPU port; a b53 switch cascaded behind one of its ports takes the
+ * 4-byte tag after it. The switches check the minimum length once the tags
+ * are stripped, so frames are padded as the taggers pad them.
+ */
+#define BRCM_LEG_TAG_TYPE	0x8874
+#define BRCM_LEG_EGRESS		(2 << 5)
+#define BRCM_LEG_TAG_LEN	6
+#define BRCM_IG_OPCODE		(1 << 5)
+#define BRCM_TAG_LEN		4
+#define FAP_SWITCH_CPU_PORT	8
+#define FAP_TX_TEST_LEN		(ETH_ZLEN + 2 * (BRCM_LEG_TAG_LEN + BRCM_TAG_LEN))
 
 /* the RAM window must sit below the peripherals in the 4KE space */
 #define FAP_4KE_PERIPH		0x10000000
@@ -136,6 +152,14 @@ struct bcm6362_fap {
 		ktime_t start;
 		ktime_t stop;
 	} rx;
+
+	/* last transmit test frame */
+	struct {
+		bool sent;
+		u8 port;
+		s8 ext;		/* port of the cascaded switch, -1 if none */
+		u16 seq;
+	} tx;
 
 	struct dentry *debugfs;
 };
@@ -937,63 +961,127 @@ DEFINE_SHOW_STORE_ATTRIBUTE(rxtest);
 
 /*
  * Transmit test. The 4KE drives one iuDMA TX channel the host does not use,
- * with a single descriptor in PSM, and reports whether the engine took the
- * frame. The frame goes to the router's own address, so with the Broadcom
- * tag appended it comes back in through the switch and the host sees it on
- * its interface; here the debugfs file only reports the engine side.
+ * with a single descriptor in PSM. Writing "port" sends a numbered broadcast
+ * out of that port of the internal switch, "port ext" out of port ext of
+ * the switch cascaded behind it; reading shows what the engine did with the
+ * last one.
  */
+
+/* locally administered, \x02FAP */
+static const u8 fap_tx_test_source[ETH_ALEN] = { 0x02, 0x46, 0x41, 0x50 };
+
+static void bcm6362_fap_tx_frame(u8 *p, unsigned int port, int ext,
+				 u16 seq)
+{
+	memset(p, 0, FAP_TX_TEST_LEN);
+	eth_broadcast_addr(p);
+	memcpy(p + ETH_ALEN, fap_tx_test_source, ETH_ALEN);
+	p += 2 * ETH_ALEN;
+
+	put_unaligned_be16(BRCM_LEG_TAG_TYPE, p);
+	p[2] = BRCM_LEG_EGRESS;
+	p[5] = port;
+	p += BRCM_LEG_TAG_LEN;
+
+	if (ext >= 0) {
+		p[0] = BRCM_IG_OPCODE;
+		p[3] = BIT(ext);
+		p += BRCM_TAG_LEN;
+	}
+
+	put_unaligned_be16(ETH_P_802_EX1, p);
+	put_unaligned_be16(seq, p + 2);
+}
+
 static int txtest_show(struct seq_file *s, void *unused)
 {
 	struct bcm6362_fap *fap = s->private;
 	struct fap_tx *tx = &fap->shared->tx;
-	void *buf;
+	u32 done;
+
+	guard(mutex)(&fap->lock);
+
+	if (!fap->tx.sent) {
+		seq_puts(s, "no frame sent yet\n");
+		return 0;
+	}
+
+	seq_printf(s, "frame %u, port %u", fap->tx.seq, fap->tx.port);
+	if (fap->tx.ext >= 0)
+		seq_printf(s, " then %d", fap->tx.ext);
+	seq_printf(s, ", channel %u\n", FAP_TX_TEST_CHANNEL);
+	if (!(READ_ONCE(tx->controller_cfg) & DMA_MASTER_EN)) {
+		seq_puts(s, "iuDMA disabled, not sent: is the conduit up?\n");
+		return 0;
+	}
+
+	done = READ_ONCE(tx->done_ticks);
+	seq_printf(s, "status 0x%04x, irq 0x%x, kick %u counts\n",
+		   READ_ONCE(tx->status), READ_ONCE(tx->irq_status),
+		   READ_ONCE(tx->kick_ticks));
+	if (done)
+		seq_printf(s, "engine took the frame in %u counts\n", done);
+	else
+		seq_puts(s, "engine did not take the frame, channel stopped\n");
+
+	return 0;
+}
+
+static ssize_t txtest_write(struct file *file, const char __user *buf,
+			    size_t count, loff_t *ppos)
+{
+	struct bcm6362_fap *fap = file_inode(file)->i_private;
+	struct fap_tx *tx = &fap->shared->tx;
+	unsigned int port, ext;
+	char cmd[16];
 	dma_addr_t dma;
-	u32 res;
-	int ret;
+	int n, ret;
+	u8 *frame;
 
-	if (!fap->psm)
-		return -ENODEV;
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
 
-	buf = dma_alloc_noncoherent(fap->dev, FAP_TX_TEST_LEN, &dma,
-				    DMA_TO_DEVICE, GFP_KERNEL);
-	if (!buf)
+	n = sscanf(cmd, "%u %u", &port, &ext);
+	if (n < 1 || port >= FAP_SWITCH_CPU_PORT ||
+	    (n == 2 && ext >= FAP_SWITCH_CPU_PORT))
+		return -EINVAL;
+
+	frame = dma_alloc_noncoherent(fap->dev, FAP_TX_TEST_LEN, &dma,
+				      DMA_TO_DEVICE, GFP_KERNEL);
+	if (!frame)
 		return -ENOMEM;
 
-	/* a zeroed frame: this bring-up only checks the engine takes it */
-	memset(buf, 0, FAP_TX_TEST_LEN);
-	dma_sync_single_for_device(fap->dev, dma, FAP_TX_TEST_LEN, DMA_TO_DEVICE);
-
 	scoped_guard(mutex, &fap->lock) {
-		if (fap->state != FAP_IDLE) {
-			ret = -ENODEV;
-			goto out;
-		}
+		bcm6362_fap_tx_frame(frame, port, n == 2 ? ext : -1,
+				     ++fap->ping_seq);
+		dma_sync_single_for_device(fap->dev, dma, FAP_TX_TEST_LEN,
+					   DMA_TO_DEVICE);
+
 		WRITE_ONCE(tx->channel, FAP_TX_TEST_CHANNEL);
 		WRITE_ONCE(tx->buf, dma);
 		WRITE_ONCE(tx->len, FAP_TX_TEST_LEN);
-		WRITE_ONCE(tx->append, 0);	/* no tag for the first bring-up */
+		WRITE_ONCE(tx->append, DMA_APPEND_CRC);
+		/* the setup is in memory before the command reaches the 4KE */
 		wmb();
 		ret = bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_TX_TEST,
-						    ++fap->ping_seq), NULL, NULL);
+						    fap->ping_seq), NULL, NULL);
+		if (!ret) {
+			fap->tx.sent = true;
+			fap->tx.port = port;
+			fap->tx.ext = n == 2 ? ext : -1;
+			fap->tx.seq = fap->ping_seq;
+		}
 	}
-	if (ret)
-		goto out;
 
-	/* pairs with the sync the firmware issues before the pong */
-	rmb();
-	res = READ_ONCE(tx->done_ticks);
-	seq_printf(s, "channel %u, status 0x%04x, kick %u counts\n",
-		   FAP_TX_TEST_CHANNEL, READ_ONCE(tx->status),
-		   READ_ONCE(tx->kick_ticks));
-	if (res)
-		seq_printf(s, "engine took the frame in %u counts\n", res);
-	else
-		seq_puts(s, "engine did not take the frame (OWN still set)\n");
-out:
-	dma_free_noncoherent(fap->dev, FAP_TX_TEST_LEN, buf, dma, DMA_TO_DEVICE);
-	return ret;
+	dma_free_noncoherent(fap->dev, FAP_TX_TEST_LEN, frame, dma,
+			     DMA_TO_DEVICE);
+
+	return ret ?: count;
 }
-DEFINE_SHOW_ATTRIBUTE(txtest);
+DEFINE_SHOW_STORE_ATTRIBUTE(txtest);
 
 /*
  * Host access timings on one word of each target, in hundredths of a ns
@@ -1257,7 +1345,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("peek", 0600, fap->debugfs, fap, &peek_fops);
 	debugfs_create_file("rxtest", 0600, fap->debugfs, fap, &rxtest_fops);
 	if (fap->psm)
-		debugfs_create_file("txtest", 0400, fap->debugfs, fap,
+		debugfs_create_file("txtest", 0600, fap->debugfs, fap,
 				    &txtest_fops);
 	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
 			    &hostbench_fops);

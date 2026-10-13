@@ -146,7 +146,7 @@ the 4KE stays in reset and the `state` debugfs file reads `offline`.
 
 - what sits on COP2;
 - DQM semantics beyond the header structs;
-- the cost of stores to the iuDMA, and whether the iuDMA can use descriptors in QSM, as the stock firmware does for ENET RX;
+- the cost of stores to the iuDMA, and whether the iuDMA can use descriptors in PSM and QSM, as the stock firmware does;
 - why direct DDR accesses from the 4KE cost twice those through a
   translator window;
 - the DDR latency with row misses, and the cost of the FAP internal DMA, which could bring packet headers into PSM;
@@ -412,21 +412,48 @@ matches the test pattern, since the rings live there.
 
 The first step is the 4KE driving one iuDMA TX channel the host does not
 use. With the host on logical channel 0 (iuDMA 0 and 1), channel 3 (the
-TX of logical channel 1) is free. The 4KE writes a single descriptor in
-PSM, as the stock keeps the FAP descriptors there, points the channel at
-it and starts it, then polls the ownership bit:
+TX of logical channel 1) is free. The 4KE sets it up as the enetsw
+driver sets up its own: ring start in the first word of the channel state
+RAM, the other three words cleared, maximum burst 8. It writes a single
+descriptor in PSM, as the stock keeps the FAP descriptors there, starts
+the channel and polls the ownership bit; if the engine does not clear it,
+the 4KE stops the channel and takes the descriptor back. The first word
+of a descriptor holds the length in its upper half and the status in the
+lower one [SDK], as in the enetsw driver.
+
+The internal switch takes frames from its CPU port with the legacy
+6-byte Broadcom tag after the source address: 0x8874, the egress opcode
+and the destination port, which DSA builds in software for the 63xx
+switches; the `DMA_APPEND_BRCM_TAG` descriptor bit is not used, and what
+it inserts is unknown. A b53 switch cascaded behind one of its ports, as
+the BCM53125 on the DSL-3580L, takes its own 4-byte tag right after
+that one. The test frame is a broadcast from 02:46:41:50:00:00 with
+ethertype 0x88b5 and a sequence number, carrying those tags, padded as
+the DSA taggers pad and with the CRC appended by the iuDMA. Writing a
+port of the internal switch sends it out of that port, writing two
+ports sends it out of the second port of the switch behind the first:
 
 ```
+cd /sys/kernel/debug/11001000.coprocessor
+ethtool -S eth0 | grep p08_      # internal switch CPU port, before
+echo 4 1 > txtest                # DSL-3580L: extsw, then lan4
 cat txtest
+ethtool -S eth0 | grep p08_      # after: one more broadcast received
 ```
 
-It reports whether the engine cleared OWN, and the cycles the start and
-the completion took. This is the first time the FAP drives the iuDMA
-rather than reading it; the frame is zeroed and not meant to leave the
-switch yet. Giving it the router's own address and the appended Broadcom
-tag, so it comes back in and the host sees it, and routing the TX DMA
-interrupt to the FAP through `miscExtra2FapIrqMask` (0xb0001840, bit 1
-for TX DMA 1), come next.
+`txtest` reports whether the iuDMA controller was enabled (the enetsw
+driver enables it when its interface opens), the descriptor status and
+the channel interrupt status, and the counts the start and the
+completion took. A PC on the port sees the frame with
+`tcpdump -e ether proto 0x88b5`. Whether the iuDMA reaches its
+descriptors in PSM at 0x11010000 is what this run answers first; routing
+the TX DMA interrupt to the FAP through `miscExtra2FapIrqMask`
+(0xb0001840, bit 1 for TX DMA 1) comes next, though polling descriptors
+in PSM at 7 cycles may make it unnecessary.
+
+For phase 4 the tags are just bytes after the source address: the FAP
+needs no knowledge of the switch topology if the host gives it, for each
+egress port, the tags DSA would push.
 
 The ENETSW TX DMA interrupts only reach the FAP, never the host
 (`extra2ChipIrqStatus`, routed by `miscExtra2FapIrqMask` at
