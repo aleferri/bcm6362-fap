@@ -167,13 +167,13 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 	if (!(fap_rd(fap, FAP_REG_IRQ_MIPS_STATUS) & FAP_IRQ_MIPS_MBOX_IN))
 		return IRQ_NONE;
 
-	fap_wr(fap, FAP_GP_MBOX_IN, FAP_REG_GP_STATUS);
+	/*
+	 * Read the message, then clear the interrupt: clearing first could
+	 * drop a notification the 4KE raises in between. A fresh message
+	 * right after is normal, not a stuck interrupt.
+	 */
 	msg = fap_rd(fap, FAP_REG_MBOX_IN);
-
-	if (fap_rd(fap, FAP_REG_IRQ_MIPS_STATUS) & FAP_IRQ_MIPS_MBOX_IN) {
-		fap_wr(fap, 0, FAP_REG_IRQ_MIPS_MASK);
-		dev_err(fap->dev, "mailbox irq stuck, masked\n");
-	}
+	fap_wr(fap, FAP_GP_MBOX_IN, FAP_REG_GP_STATUS);
 
 	fap->mbox_last = msg;
 	fap->mbox_count++;
@@ -908,7 +908,7 @@ static ssize_t rxtest_write(struct file *file, const char __user *buf,
 			    size_t count, loff_t *ppos)
 {
 	struct bcm6362_fap *fap = file_inode(file)->i_private;
-	char cmd[8];
+	char cmd[24];
 	int ret = 0;
 
 	if (count >= sizeof(cmd))

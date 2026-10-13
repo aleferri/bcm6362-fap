@@ -149,6 +149,17 @@ static void mbox_send(unsigned int type, unsigned int val)
 		__asm__ volatile("ei\n\tehb" : : : "memory");
 }
 
+/*
+ * A receive doorbell: the host reads what it needs from the ring, so this
+ * carries no value and must not block. irq_armed already limits it to one
+ * outstanding notification, so there is nothing to wait for.
+ */
+static void mbox_notify(void)
+{
+	__asm__ volatile("sync" ::: "memory");
+	reg_wr(FAP_REG_MBOX_IN, FAP_MSG(FAP_MSG_RX, 0));
+}
+
 static void mbox_pong(unsigned int cmd)
 {
 	shared->pong_count = read_c0(CP0_COUNT, 0);
@@ -446,7 +457,7 @@ static void rx_step(void)
 	if (rxq->irq_armed) {
 		rxq->irq_armed = 0;
 		shared->rx.notifies++;
-		mbox_send(FAP_MSG_RX, 0);
+		mbox_notify();
 	}
 }
 
