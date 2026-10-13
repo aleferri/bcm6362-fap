@@ -48,7 +48,6 @@
 #define CP0_TAGHI		$29
 
 #define ST0_IE			(1 << 0)
-#define ST0_BEV			(1 << 22)
 #define ST0_IM_FAP		(1 << 10)	/* IP2: irq_4ke_status */
 #define ST0_IM_TIMER		(1 << 15)	/* IP7: CP0 Count/Compare */
 

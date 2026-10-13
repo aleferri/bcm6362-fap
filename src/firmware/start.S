@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include "fap_shared.h"
 #include "fap4ke.h"
 
 /* exception frame: o32 argument area, then one slot per GPR, then HI/LO */
@@ -38,6 +39,15 @@ _reset:
 
 	.text
 _start:
+	/*
+	 * Vectors on the block through the boot window, so that the low
+	 * translator is not needed. EBase may only change with BEV set, as
+	 * it is out of reset.
+	 */
+	li	$t0, FAP_4KE_EBASE
+	mtc0	$t0, CP0_EBASE, 1
+	ehb
+
 	mtc0	$zero, CP0_CAUSE
 	mtc0	$zero, CP0_STATUS
 

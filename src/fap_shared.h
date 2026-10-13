@@ -14,8 +14,9 @@
 /* 4KE physical address the block is mapped at to cover the reset vector */
 #define FAP_4KE_BOOT_BASE	0x1fc00000
 
-/* exception base moved onto the block, kseg0 */
+/* exception base set at boot onto the block, kseg0 */
 #define FAP_4KE_EBASE		(0x80000000 | FAP_4KE_BOOT_BASE)
+#define FAP_EBASE_BASE_MASK	0xfffff000	/* the rest is CPUNum */
 
 /* queue and packet shared memories, local to the FAP */
 #define FAP_QSM_SIZE		0x4000
@@ -55,8 +56,7 @@
 #define FAP_CMD_PING		0
 #define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
 #define FAP_CMD_PROBE_DDR	2	/* value: host address of the block >> 16 */
-#define FAP_CMD_MOVE_EBASE	3	/* fills fap_shared.ebase */
-#define FAP_CMD_PEEK		4	/* reads the word at fap_shared.peek_addr */
+#define FAP_CMD_PEEK		3	/* reads the word at fap_shared.peek_addr */
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -128,7 +128,7 @@ struct fap_shared {
 	unsigned int ddr_direct_magic;
 	unsigned int ddr_direct_load;	/* benchmark ticks */
 
-	unsigned int ebase;		/* read back after FAP_CMD_MOVE_EBASE */
+	unsigned int ebase;		/* read back at boot */
 
 	unsigned int peek_addr;		/* 4KE virtual address, from the host */
 	unsigned int peek_val;

@@ -20,6 +20,7 @@ Next to every fact in this summary is its source:
 | Other | MIPS16e, EJTAG, COP2 interface present (what is attached to it is unknown), no FPU and no performance counters | [HW] |
 | Frequency | 166.67 MHz, CP0 Count at 83.33 MHz (resolution 2), measured against the host clock. The SDK comments say 200 MHz | [HW] |
 | Interrupts | CP0 timer on IP7 (IntCtl.IPTI), FAP block on IP2. Entry into a C handler 54–740 cycles, including the context save | [HW] |
+| EBase | Writable: moved to 0x9fc00000 at run time, interrupts keep working. CPUNum (bits 9:0) reads 2 [HW]. The firmware now sets it at boot | [HW] |
 
 ### Access cost
 
@@ -212,9 +213,9 @@ The firmware now:
   It only reads: the enetsw and b53 drivers own those blocks;
 - on another host command, reads its own shared area at the host physical
   address of the block, outside the translator windows, and times it;
-- on a third one, moves EBase onto the block through the boot window, so
-  that the low translator at 0 is only needed until then;
-- on a fourth one, loads once from any 4KE virtual address the host
+- sets EBase onto the block through the boot window at boot, so that the
+  low translator at 0 is no longer needed for the vectors;
+- on a third one, loads once from any 4KE virtual address the host
   gives, to see what the 4KE reaches without a new firmware.
 
 The host side boots the firmware at probe and leaves it idle, holds the
@@ -240,10 +241,6 @@ cat iudma
 devmem 0x1000d800; devmem 0x1000da00; devmem 0x1000dc00
 cat hostbench
 cat ddr
-echo move > ebase; cat ebase
-cat stats; echo 0x1234 > mbox; cat stats
-echo park > ebase; cat ebase
-cat stats; echo 0x1234 > mbox; cat stats
 ```
 
 `hostbench` times host loads and stores on the FAP scratch register, QSM,
@@ -290,11 +287,6 @@ What to read:
   physical addresses below 512 MB and kuseg maps virtual v to physical
   v + 0x40000000, uncached here (Config.KU = 2): the PCIe window at
   physical 0xa0000000 is at virtual 0x60000000 [ded.].
-- `ebase`: after `move` it should read 0x9fc00000; heartbeat and pings
-  growing afterwards mean the interrupts take the new vector. `park`
-  moves the low translator away from 0 (no enable bit is known, so it is
-  pointed at an address the firmware never uses); heartbeat and pings
-  growing after it mean the low window is no longer needed.
 
 ### From the measurements to the budget
 

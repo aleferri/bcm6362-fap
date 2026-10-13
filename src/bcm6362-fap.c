@@ -47,12 +47,6 @@
 /* 4KE address bits the translators ignore, making kseg0/kseg1 aliases */
 #define FAP_ADDR_IGNORE		0xa0000000
 
-/*
- * No enable bit is known for the translators: an unused one is parked on
- * a 4KE address the firmware never uses, away from RAM and peripherals.
- */
-#define FAP_4KE_PARK_BASE	0x1e000000
-
 #define FAP_REG_SOFT_RESETS	0x8c
 #define  FAP_SOFT_RESET_4KE	BIT(0)
 #define FAP_REG_CORE_STATUS	0x94
@@ -537,51 +531,6 @@ static int ddr_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ddr);
 
-static int ebase_show(struct seq_file *s, void *unused)
-{
-	struct bcm6362_fap *fap = s->private;
-
-	seq_printf(s, "ebase 0x%08x, low window at 0x%08x\n",
-		   READ_ONCE(fap->shared->ebase),
-		   fap_rd(fap, FAP_REG_ADDR1 + FAP_ADDR_BASE_IN));
-
-	return 0;
-}
-
-/* "move": vectors onto the boot window; "park": free the low window */
-static ssize_t ebase_write(struct file *file, const char __user *buf,
-			   size_t count, loff_t *ppos)
-{
-	struct bcm6362_fap *fap = file_inode(file)->i_private;
-	char cmd[8];
-	int ret = 0;
-
-	if (count >= sizeof(cmd))
-		return -EINVAL;
-	if (copy_from_user(cmd, buf, count))
-		return -EFAULT;
-	cmd[count] = '\0';
-
-	guard(mutex)(&fap->lock);
-
-	if (sysfs_streq(cmd, "move")) {
-		ret = bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_MOVE_EBASE,
-						    ++fap->ping_seq),
-				       NULL, NULL);
-	} else if (sysfs_streq(cmd, "park")) {
-		/* pairs with the sync the firmware issues before the pong */
-		rmb();
-		if (READ_ONCE(fap->shared->ebase) != FAP_4KE_EBASE)
-			return -EBUSY;
-		bcm6362_fap_map(fap, FAP_REG_ADDR1, FAP_4KE_PARK_BASE);
-	} else {
-		return -EINVAL;
-	}
-
-	return ret ?: count;
-}
-DEFINE_SHOW_STORE_ATTRIBUTE(ebase);
-
 static int peek_show(struct seq_file *s, void *unused)
 {
 	struct bcm6362_fap *fap = s->private;
@@ -827,7 +776,6 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("stats", 0400, fap->debugfs, fap, &stats_fops);
 	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
 	debugfs_create_file("ddr", 0400, fap->debugfs, fap, &ddr_fops);
-	debugfs_create_file("ebase", 0600, fap->debugfs, fap, &ebase_fops);
 	debugfs_create_file("peek", 0600, fap->debugfs, fap, &peek_fops);
 	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
 			    &hostbench_fops);

@@ -326,22 +326,6 @@ static void ddr_probe(unsigned int block)
 	shared->ddr_direct_load = bench_load(magic, FAP_BENCH_ITERS);
 }
 
-/*
- * Vectors on the block through the boot window instead of the low one at
- * 0, which the host can then reuse. EBase may only change with BEV set.
- */
-static void ebase_move(void)
-{
-	unsigned int status = read_c0(CP0_STATUS, 0);
-
-	write_c0(CP0_STATUS, 0, (status & ~ST0_IE) | ST0_BEV);
-	write_c0(CP0_EBASE, 1, FAP_4KE_EBASE);
-	write_c0(CP0_STATUS, 0, status);
-
-	shared->ebase = read_c0(CP0_EBASE, 1);
-	log_reg("ebase", shared->ebase);
-}
-
 /* one load only: the address may be a register with read side effects */
 static void peek(void)
 {
@@ -362,9 +346,6 @@ static void run_command(unsigned int cmd)
 		break;
 	case FAP_CMD_PROBE_DDR:
 		ddr_probe(FAP_MSG_VALUE(cmd));
-		break;
-	case FAP_CMD_MOVE_EBASE:
-		ebase_move();
 		break;
 	case FAP_CMD_PEEK:
 		peek();
@@ -413,6 +394,8 @@ void fap_main(void)
 	log_reg("config", read_c0(CP0_CONFIG, 0));
 	log_reg("config1", read_c0(CP0_CONFIG, 1));
 	log_reg("intctl", read_c0(CP0_STATUS, 1));
+	shared->ebase = read_c0(CP0_EBASE, 1);
+	log_reg("ebase", shared->ebase);
 	log_reg("count res", shared->count_res);
 
 	if (dspram_test())
