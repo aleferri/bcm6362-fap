@@ -56,6 +56,21 @@ static unsigned int main_loops_seen __attribute__((section(".dspram")));
 /* host command left by the interrupt handler for the main loop */
 static volatile unsigned int command __attribute__((section(".dspram")));
 
+static volatile struct fap_rx_qsm *const rxq =
+	(volatile struct fap_rx_qsm *)(FAP_4KE_QSM + FAP_RX_QSM_OFFSET);
+
+/* receive test state */
+static struct {
+	unsigned int active;
+	unsigned int window;		/* kseg1 address of host address 0 */
+	volatile unsigned int *comp;
+	unsigned int len;
+	unsigned int free_cons;
+	unsigned int comp_prod;
+	unsigned int idle_free;
+	unsigned int idle_ring;
+} rx __attribute__((section(".dspram")));
+
 static unsigned int reg_rd(unsigned int off)
 {
 	return *(volatile unsigned int *)(FAP_4KE_REGS + off);
@@ -102,9 +117,13 @@ static void log_reg(const char *name, unsigned int val)
 }
 
 /* the host clears FAP_GP_MBOX_IN once it has read the previous message */
+/* also used by the main loop, so interrupts are off while it runs */
 static void mbox_send(unsigned int type, unsigned int val)
 {
 	unsigned int start = read_c0(CP0_COUNT, 0);
+	unsigned int status;
+
+	__asm__ volatile("di %0\n\tehb" : "=r" (status) : : "memory");
 
 	while (reg_rd(FAP_REG_GP_STATUS) & FAP_GP_MBOX_IN) {
 		if (read_c0(CP0_COUNT, 0) - start > MBOX_ACK_TIMEOUT) {
@@ -116,6 +135,9 @@ static void mbox_send(unsigned int type, unsigned int val)
 	/* shared memory updates first, the host reads them on the message */
 	__asm__ volatile("sync" ::: "memory");
 	reg_wr(FAP_REG_MBOX_IN, FAP_MSG(type, val));
+
+	if (status & ST0_IE)
+		__asm__ volatile("ei\n\tehb" : : : "memory");
 }
 
 static void mbox_pong(unsigned int cmd)
@@ -332,6 +354,79 @@ static void peek(void)
 	shared->peek_val = val;
 }
 
+static void rx_publish(void)
+{
+	shared->rx.frames = rx.comp_prod;
+	shared->rx.idle_free = rx.idle_free;
+	shared->rx.idle_ring = rx.idle_ring;
+}
+
+static void rx_start(void)
+{
+	rx.window = KSEG1(shared->rx.ram_window);
+	rx.comp = (volatile unsigned int *)(rx.window + shared->rx.comp_ring);
+	rx.len = shared->rx.frame_len;
+	rx.free_cons = 0;
+	rx.comp_prod = 0;
+	rx.idle_free = 0;
+	rx.idle_ring = 0;
+	shared->rx.notifies = 0;
+	rx_publish();
+	rx.active = 1;
+}
+
+static void rx_stop(void)
+{
+	rx.active = 0;
+	rx_publish();
+}
+
+#define RX_BATCH	16
+
+/* fills free buffers, as the iuDMA will, and hands them to the host */
+static void rx_step(void)
+{
+	unsigned int n, i;
+
+	for (n = 0; n < RX_BATCH; n++) {
+		volatile unsigned int *buf;
+		unsigned int addr;
+
+		if (rx.free_cons == rxq->free_prod) {
+			rx.idle_free++;
+			break;
+		}
+		if (rx.comp_prod - rxq->comp_cons >= FAP_RX_COMP_ENTRIES) {
+			rx.idle_ring++;
+			break;
+		}
+
+		addr = rxq->free_ring[rx.free_cons % FAP_RX_FREE_ENTRIES];
+		rx.free_cons++;
+
+		buf = (volatile unsigned int *)(rx.window + addr);
+		for (i = 0; i < FAP_RX_PATTERN_WORDS; i++)
+			buf[i] = FAP_RX_PATTERN(rx.comp_prod, i);
+
+		/* the frame is in memory before its entry */
+		__asm__ volatile("sync" ::: "memory");
+		rx.comp[rx.comp_prod % FAP_RX_COMP_ENTRIES] =
+			FAP_RX_PHASE(rx.comp_prod, FAP_RX_COMP_ENTRIES) |
+			addr | rx.len;
+		rx.comp_prod++;
+	}
+
+	if (!n)
+		return;
+
+	rx_publish();
+	if (rxq->irq_armed) {
+		rxq->irq_armed = 0;
+		shared->rx.notifies++;
+		mbox_send(FAP_MSG_RX, 0);
+	}
+}
+
 static void run_command(unsigned int cmd)
 {
 	switch (FAP_MSG_TYPE(cmd)) {
@@ -343,6 +438,12 @@ static void run_command(unsigned int cmd)
 		break;
 	case FAP_CMD_PEEK:
 		peek();
+		break;
+	case FAP_CMD_RX_START:
+		rx_start();
+		break;
+	case FAP_CMD_RX_STOP:
+		rx_stop();
 		break;
 	}
 
@@ -380,6 +481,7 @@ void fap_main(void)
 	main_loops = 0;
 	main_loops_seen = 0;
 	command = 0;
+	rx.active = 0;
 	shared->magic = FAP_SHARED_MAGIC;
 	shared->count_res = count_res();
 
@@ -415,6 +517,9 @@ void fap_main(void)
 			command = 0;
 			run_command(cmd);
 		}
-		__asm__ volatile("wait");
+		if (rx.active)
+			rx_step();
+		else
+			__asm__ volatile("wait");
 	}
 }

@@ -52,11 +52,14 @@
 #define  FAP_READY_QSM		(1 << 2)	/* memory test passed */
 #define FAP_MSG_PONG		2
 #define FAP_MSG_EXCEPTION	3
+#define FAP_MSG_RX		4	/* completions posted, the host had armed */
 
 #define FAP_CMD_PING		0
 #define FAP_CMD_PROBE_IUDMA	1	/* fills fap_shared.iudma */
 #define FAP_CMD_PROBE_DDR	2	/* value: host address of the block >> 16 */
 #define FAP_CMD_PEEK		3	/* reads the word at fap_shared.peek_addr */
+#define FAP_CMD_RX_START	4	/* setup in fap_shared.rx and fap_rx_qsm */
+#define FAP_CMD_RX_STOP		5
 
 /* ENETSW iuDMA channels sampled by FAP_CMD_PROBE_IUDMA */
 #define FAP_IUDMA_PROBE_CHANNELS	2
@@ -75,6 +78,33 @@
 
 /* DDR loads alternating between two words this far apart, i < 2 */
 #define FAP_BENCH_DDR_FAR(i)	(0x1000 << (3 * (i)))
+
+/*
+ * Receive path test. The host owns a pool of buffers in DDR and hands
+ * their addresses to the 4KE through a free ring in QSM; the 4KE writes a
+ * frame header into each and gives it back through a completion ring in
+ * DDR. Each side writes across the bus and reads locally. Indices are
+ * free running counters, the rings are powers of two.
+ */
+#define FAP_RX_BUF_SIZE		0x800
+#define FAP_RX_FREE_ENTRIES	256
+#define FAP_RX_COMP_ENTRIES	256
+#define FAP_RX_QSM_OFFSET	0
+
+/*
+ * Completion entry: the phase bit flips at every pass over the ring, so
+ * the host tells new entries apart without a producer index. Buffers are
+ * FAP_RX_BUF_SIZE aligned and below 256 MB.
+ */
+#define FAP_RX_COMP_PHASE	0x80000000
+#define FAP_RX_COMP_ADDR	0x0ffff800
+#define FAP_RX_COMP_LEN		0x000007ff
+#define FAP_RX_PHASE(count, entries) \
+	((((count) / (entries)) & 1) ? 0 : FAP_RX_COMP_PHASE)
+
+/* the header the 4KE writes in each buffer, numbered frame after frame */
+#define FAP_RX_PATTERN_WORDS	16
+#define FAP_RX_PATTERN(seq, i)	((seq) * FAP_RX_PATTERN_WORDS + (i))
 
 #ifndef __ASSEMBLER__
 enum fap_bench_target {
@@ -130,8 +160,32 @@ struct fap_shared {
 	unsigned int peek_val;
 	unsigned int peek_ticks;	/* CP0 Count ticks around the load */
 
+	struct fap_rx {
+		/* set by the host before FAP_CMD_RX_START */
+		unsigned int ram_window;	/* 4KE address of host address 0 */
+		unsigned int comp_ring;		/* host address */
+		unsigned int frame_len;
+		/* written by the 4KE */
+		unsigned int frames;
+		unsigned int notifies;
+		unsigned int idle_free;		/* passes without free buffers */
+		unsigned int idle_ring;		/* passes with the ring full */
+	} rx;
+
 	char log[FAP_LOG_SIZE];
 };
+
+/* in QSM: written by the host and read by the 4KE, but irq_armed */
+struct fap_rx_qsm {
+	unsigned int free_prod;
+	unsigned int comp_cons;
+	unsigned int irq_armed;		/* the 4KE clears it when it notifies */
+	unsigned int reserved;
+	unsigned int free_ring[FAP_RX_FREE_ENTRIES];
+};
+
+_Static_assert(FAP_RX_QSM_OFFSET + sizeof(struct fap_rx_qsm) <= FAP_QSM_SIZE,
+	       "receive queue larger than the QSM");
 
 _Static_assert(sizeof(struct fap_shared) <= FAP_MEM_SIZE - FAP_SHARED_OFFSET,
 	       "shared area larger than its slot");

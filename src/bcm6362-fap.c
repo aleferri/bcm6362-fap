@@ -21,10 +21,13 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/log2.h>
 #include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/seq_file.h>
@@ -55,6 +58,14 @@
 #define FAP_CLOCK_SAMPLE_MS	1000
 #define FAP_WATCHDOG_MS		1000
 #define FAP_HOST_BENCH_ACCESSES	4096
+
+/* receive test: buffers in flight, frame length, entries per poll */
+#define FAP_RX_POOL_BUFS	128
+#define FAP_RX_TEST_LEN		1514
+#define FAP_RX_BUDGET		64
+
+/* the RAM window must sit below the peripherals in the 4KE space */
+#define FAP_4KE_PERIPH		0x10000000
 
 static char *firmware = "bcm6362-fap.bin";
 module_param(firmware, charp, 0444);
@@ -97,6 +108,26 @@ struct bcm6362_fap {
 	u32 pong_msg;
 	ktime_t pong_time;
 
+	/* receive test, all but active touched only by the test and its work */
+	struct {
+		bool active;
+		struct work_struct work;
+		void *pool;
+		dma_addr_t pool_dma;
+		u32 *comp;
+		dma_addr_t comp_dma;
+		u32 comp_cons;
+		u32 free_prod;
+		u32 seq;
+		u64 frames;
+		u64 errors;
+		u64 gaps;
+		u64 bad;
+		u64 busy_ns;
+		ktime_t start;
+		ktime_t stop;
+	} rx;
+
 	struct dentry *debugfs;
 };
 
@@ -110,13 +141,13 @@ static inline void fap_wr(struct bcm6362_fap *fap, u32 val, unsigned int off)
 	__raw_writel(val, fap->regs + off);
 }
 
+/* a power of two sized, naturally aligned window on both sides */
 static void bcm6362_fap_map(struct bcm6362_fap *fap, unsigned int reg,
-			    u32 fap_base)
+			    u32 fap_base, dma_addr_t host_base, u32 size)
 {
-	fap_wr(fap, ~((FAP_MEM_SIZE - 1) | FAP_ADDR_IGNORE),
-	       reg + FAP_ADDR_MASK);
+	fap_wr(fap, ~((size - 1) | FAP_ADDR_IGNORE), reg + FAP_ADDR_MASK);
 	fap_wr(fap, fap_base, reg + FAP_ADDR_BASE_IN);
-	fap_wr(fap, fap->mem_dma, reg + FAP_ADDR_BASE_OUT);
+	fap_wr(fap, host_base, reg + FAP_ADDR_BASE_OUT);
 }
 
 static int bcm6362_fap_load(struct bcm6362_fap *fap)
@@ -171,6 +202,10 @@ static irqreturn_t bcm6362_fap_isr(int irq, void *data)
 			 msg & FAP_READY_DSPRAM ? "ok" : "failed",
 			 msg & FAP_READY_PSM ? "ok" : "failed",
 			 msg & FAP_READY_QSM ? "ok" : "failed");
+		break;
+	case FAP_MSG_RX:
+		if (READ_ONCE(fap->rx.active))
+			queue_work(system_highpri_wq, &fap->rx.work);
 		break;
 	case FAP_MSG_EXCEPTION:
 		dev_err(fap->dev, "4KE exception, ExcCode %u\n",
@@ -567,6 +602,338 @@ static ssize_t peek_write(struct file *file, const char __user *buf,
 DEFINE_SHOW_STORE_ATTRIBUTE(peek);
 
 /*
+ * Receive test. The QSM is written with plain stores: on MIPS the MMIO
+ * accessors issue a sync per access, and the ordering that matters is
+ * enforced with explicit barriers.
+ */
+static void fap_rxq_wr(struct bcm6362_fap *fap, unsigned int off, u32 val)
+{
+	WRITE_ONCE(*(u32 __force *)(fap->qsm + FAP_RX_QSM_OFFSET + off), val);
+}
+
+#define FAP_RXQ(field)		offsetof(struct fap_rx_qsm, field)
+
+static u32 bcm6362_fap_rx_entry(struct bcm6362_fap *fap)
+{
+	unsigned int slot = fap->rx.comp_cons % FAP_RX_COMP_ENTRIES;
+	dma_addr_t dma = fap->rx.comp_dma + slot * 4;
+	u32 entry;
+
+	dma_sync_single_for_cpu(fap->dev, dma, 4, DMA_FROM_DEVICE);
+	entry = READ_ONCE(fap->rx.comp[slot]);
+	/*
+	 * The 4KE keeps writing this line, and on most non-coherent MIPS the
+	 * sync above does nothing: drop the line again so that the next
+	 * read reaches memory.
+	 */
+	dma_sync_single_for_device(fap->dev, dma, 4, DMA_FROM_DEVICE);
+
+	return entry;
+}
+
+static bool bcm6362_fap_rx_ready(struct bcm6362_fap *fap, u32 entry)
+{
+	return (entry & FAP_RX_COMP_PHASE) ==
+	       FAP_RX_PHASE(fap->rx.comp_cons, FAP_RX_COMP_ENTRIES);
+}
+
+/* checks the header the 4KE wrote and gives the buffer back to it */
+static void bcm6362_fap_rx_frame(struct bcm6362_fap *fap, u32 entry)
+{
+	u32 addr = entry & FAP_RX_COMP_ADDR;
+	u32 off = addr - fap->rx.pool_dma;
+	u32 *buf, seq;
+	int i;
+
+	if (off >= FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE ||
+	    (entry & FAP_RX_COMP_LEN) != FAP_RX_TEST_LEN) {
+		fap->rx.bad++;
+		return;
+	}
+
+	buf = fap->rx.pool + off;
+	dma_sync_single_for_cpu(fap->dev, addr, FAP_RX_PATTERN_WORDS * 4,
+				DMA_FROM_DEVICE);
+
+	seq = buf[0] / FAP_RX_PATTERN_WORDS;
+	for (i = 0; i < FAP_RX_PATTERN_WORDS; i++) {
+		if (buf[i] != FAP_RX_PATTERN(seq, i)) {
+			fap->rx.errors++;
+			break;
+		}
+	}
+	if (seq != fap->rx.seq)
+		fap->rx.gaps++;
+	fap->rx.seq = seq + 1;
+	fap->rx.frames++;
+
+	dma_sync_single_for_device(fap->dev, addr, FAP_RX_PATTERN_WORDS * 4,
+				   DMA_FROM_DEVICE);
+	fap_rxq_wr(fap, FAP_RXQ(free_ring) +
+		   (fap->rx.free_prod % FAP_RX_FREE_ENTRIES) * 4, addr);
+	fap->rx.free_prod++;
+}
+
+static int bcm6362_fap_rx_poll(struct bcm6362_fap *fap, int budget)
+{
+	int n;
+
+	for (n = 0; n < budget; n++) {
+		u32 entry = bcm6362_fap_rx_entry(fap);
+
+		if (!bcm6362_fap_rx_ready(fap, entry))
+			break;
+		bcm6362_fap_rx_frame(fap, entry);
+		fap->rx.comp_cons++;
+	}
+
+	if (n) {
+		/* the free ring entries before the index publishing them */
+		wmb();
+		fap_rxq_wr(fap, FAP_RXQ(free_prod), fap->rx.free_prod);
+		fap_rxq_wr(fap, FAP_RXQ(comp_cons), fap->rx.comp_cons);
+	}
+
+	return n;
+}
+
+static void bcm6362_fap_rx_work(struct work_struct *work)
+{
+	struct bcm6362_fap *fap = container_of(work, struct bcm6362_fap,
+					       rx.work);
+	ktime_t start = ktime_get();
+
+	do {
+		while (bcm6362_fap_rx_poll(fap, FAP_RX_BUDGET) == FAP_RX_BUDGET)
+			cond_resched();
+
+		fap_rxq_wr(fap, FAP_RXQ(irq_armed), 1);
+		/* armed before looking again, or a notification is missed */
+		mb();
+	} while (bcm6362_fap_rx_ready(fap, bcm6362_fap_rx_entry(fap)));
+
+	fap->rx.busy_ns += ktime_to_ns(ktime_sub(ktime_get(), start));
+}
+
+/*
+ * The low translator maps the RAM right above its own range in the 4KE
+ * space, where nothing else is: host address a is 4KE address size + a.
+ */
+static int bcm6362_fap_ram_window(struct bcm6362_fap *fap, u32 *base)
+{
+	struct device_node *np;
+	struct resource res;
+	u32 size;
+	int ret;
+
+	np = of_find_node_by_type(NULL, "memory");
+	if (!np)
+		return -ENODEV;
+	ret = of_address_to_resource(np, 0, &res);
+	of_node_put(np);
+	if (ret)
+		return ret;
+
+	size = roundup_pow_of_two(res.end + 1);
+	if (res.start || 2ULL * size > FAP_4KE_PERIPH) {
+		dev_err(fap->dev, "RAM %pR does not fit the 4KE space\n", &res);
+		return -ERANGE;
+	}
+
+	bcm6362_fap_map(fap, FAP_REG_ADDR1, size, 0, size);
+	*base = size;
+
+	return 0;
+}
+
+static void bcm6362_fap_rx_free(struct bcm6362_fap *fap)
+{
+	if (fap->rx.comp)
+		dma_free_noncoherent(fap->dev, FAP_RX_COMP_ENTRIES * 4,
+				     fap->rx.comp, fap->rx.comp_dma,
+				     DMA_FROM_DEVICE);
+	if (fap->rx.pool)
+		dma_free_noncoherent(fap->dev,
+				     FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
+				     fap->rx.pool, fap->rx.pool_dma,
+				     DMA_FROM_DEVICE);
+	fap->rx.comp = NULL;
+	fap->rx.pool = NULL;
+}
+
+static void bcm6362_fap_rx_stop(struct bcm6362_fap *fap)
+{
+	lockdep_assert_held(&fap->lock);
+
+	if (!fap->rx.active)
+		return;
+
+	/* a held 4KE writes nothing anymore */
+	if (fap->state == FAP_IDLE &&
+	    bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_RX_STOP, ++fap->ping_seq),
+			     NULL, NULL))
+		dev_warn(fap->dev, "4KE did not acknowledge the receive stop\n");
+
+	WRITE_ONCE(fap->rx.active, false);
+	cancel_work_sync(&fap->rx.work);
+	fap->rx.stop = ktime_get();
+	bcm6362_fap_rx_free(fap);
+}
+
+static int bcm6362_fap_rx_start(struct bcm6362_fap *fap)
+{
+	u32 window;
+	int i, ret;
+
+	lockdep_assert_held(&fap->lock);
+
+	if (fap->rx.active)
+		return -EBUSY;
+	if (fap->state != FAP_IDLE || !fap->qsm)
+		return -ENODEV;
+
+	/* the vectors must not need the low window, which the RAM takes */
+	if ((READ_ONCE(fap->shared->ebase) & FAP_EBASE_BASE_MASK) !=
+	    FAP_4KE_EBASE) {
+		dev_err(fap->dev, "4KE EBase 0x%08x, low window still needed\n",
+			READ_ONCE(fap->shared->ebase));
+		return -EBUSY;
+	}
+
+	fap->rx.pool = dma_alloc_noncoherent(fap->dev,
+					     FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
+					     &fap->rx.pool_dma,
+					     DMA_FROM_DEVICE, GFP_KERNEL);
+	fap->rx.comp = dma_alloc_noncoherent(fap->dev,
+					     FAP_RX_COMP_ENTRIES * 4,
+					     &fap->rx.comp_dma,
+					     DMA_FROM_DEVICE, GFP_KERNEL);
+	if (!fap->rx.pool || !fap->rx.comp) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	if (fap->rx.pool_dma + FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE >
+	    FAP_RX_COMP_ADDR + 1) {
+		ret = -ERANGE;
+		goto err_free;
+	}
+
+	ret = bcm6362_fap_ram_window(fap, &window);
+	if (ret)
+		goto err_free;
+
+	/* no dirty line of ours may land over what the 4KE writes */
+	memset(fap->rx.comp, 0, FAP_RX_COMP_ENTRIES * 4);
+	dma_sync_single_for_device(fap->dev, fap->rx.comp_dma,
+				   FAP_RX_COMP_ENTRIES * 4, DMA_FROM_DEVICE);
+	dma_sync_single_for_device(fap->dev, fap->rx.pool_dma,
+				   FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
+				   DMA_FROM_DEVICE);
+
+	fap->rx.comp_cons = 0;
+	fap->rx.free_prod = 0;
+	fap->rx.seq = 0;
+	fap->rx.frames = 0;
+	fap->rx.errors = 0;
+	fap->rx.gaps = 0;
+	fap->rx.bad = 0;
+	fap->rx.busy_ns = 0;
+
+	for (i = 0; i < FAP_RX_POOL_BUFS; i++)
+		fap_rxq_wr(fap, FAP_RXQ(free_ring) + i * 4,
+			   fap->rx.pool_dma + i * FAP_RX_BUF_SIZE);
+	fap->rx.free_prod = FAP_RX_POOL_BUFS;
+	fap_rxq_wr(fap, FAP_RXQ(comp_cons), 0);
+	fap_rxq_wr(fap, FAP_RXQ(irq_armed), 1);
+	/* the ring before the index publishing it */
+	wmb();
+	fap_rxq_wr(fap, FAP_RXQ(free_prod), fap->rx.free_prod);
+
+	WRITE_ONCE(fap->shared->rx.ram_window, window);
+	WRITE_ONCE(fap->shared->rx.comp_ring, fap->rx.comp_dma);
+	WRITE_ONCE(fap->shared->rx.frame_len, FAP_RX_TEST_LEN);
+	/* the setup is in memory before the command reaches the 4KE */
+	wmb();
+
+	WRITE_ONCE(fap->rx.active, true);
+	fap->rx.start = ktime_get();
+	ret = bcm6362_fap_ping(fap, FAP_MSG(FAP_CMD_RX_START, ++fap->ping_seq),
+			       NULL, NULL);
+	if (ret) {
+		WRITE_ONCE(fap->rx.active, false);
+		cancel_work_sync(&fap->rx.work);
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	bcm6362_fap_rx_free(fap);
+	return ret;
+}
+
+/* on removal, after the 4KE is held */
+static void bcm6362_fap_rx_release(void *data)
+{
+	struct bcm6362_fap *fap = data;
+
+	guard(mutex)(&fap->lock);
+	bcm6362_fap_rx_stop(fap);
+}
+
+static int rxtest_show(struct seq_file *s, void *unused)
+{
+	struct bcm6362_fap *fap = s->private;
+	struct fap_rx *frx = &fap->shared->rx;
+	u64 ns, rate, busy;
+
+	guard(mutex)(&fap->lock);
+
+	ns = ktime_to_ns(ktime_sub(fap->rx.active ? ktime_get() :
+				   fap->rx.stop, fap->rx.start));
+	rate = ns ? div64_u64(fap->rx.frames * NSEC_PER_SEC, ns) : 0;
+	busy = ns ? div64_u64(fap->rx.busy_ns * 10000, ns) : 0;
+
+	seq_printf(s, "active  %s\n", fap->rx.active ? "yes" : "no");
+	seq_printf(s, "host    frames %llu errors %llu gaps %llu bad %llu\n",
+		   fap->rx.frames, fap->rx.errors, fap->rx.gaps, fap->rx.bad);
+	seq_printf(s, "        %llu frames/s, cpu %llu.%02llu%%\n", rate,
+		   busy / 100, busy % 100);
+	seq_printf(s, "4ke     frames %u notifies %u idle free %u ring %u\n",
+		   READ_ONCE(frx->frames), READ_ONCE(frx->notifies),
+		   READ_ONCE(frx->idle_free), READ_ONCE(frx->idle_ring));
+
+	return 0;
+}
+
+static ssize_t rxtest_write(struct file *file, const char __user *buf,
+			    size_t count, loff_t *ppos)
+{
+	struct bcm6362_fap *fap = file_inode(file)->i_private;
+	char cmd[8];
+	int ret = 0;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+
+	guard(mutex)(&fap->lock);
+
+	if (sysfs_streq(cmd, "start"))
+		ret = bcm6362_fap_rx_start(fap);
+	else if (sysfs_streq(cmd, "stop"))
+		bcm6362_fap_rx_stop(fap);
+	else
+		return -EINVAL;
+
+	return ret ?: count;
+}
+DEFINE_SHOW_STORE_ATTRIBUTE(rxtest);
+
+/*
  * Host access timings on one word of each target, in hundredths of a ns
  * per access, both with plain loads and stores and with the MMIO
  * accessors, which on MIPS issue a sync around every access. Loads add
@@ -698,6 +1065,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	fap->dev = dev;
 	init_completion(&fap->pong);
+	INIT_WORK(&fap->rx.work, bcm6362_fap_rx_work);
 
 	ret = devm_mutex_init(dev, &fap->lock);
 	if (ret)
@@ -748,8 +1116,9 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "loading %s\n", firmware);
 
-	bcm6362_fap_map(fap, FAP_REG_ADDR1, 0);
-	bcm6362_fap_map(fap, FAP_REG_ADDR2, FAP_4KE_BOOT_BASE);
+	bcm6362_fap_map(fap, FAP_REG_ADDR1, 0, fap->mem_dma, FAP_MEM_SIZE);
+	bcm6362_fap_map(fap, FAP_REG_ADDR2, FAP_4KE_BOOT_BASE, fap->mem_dma,
+			FAP_MEM_SIZE);
 
 	/* the interrupt handler kicks the watchdog on exceptions */
 	ret = devm_delayed_work_autocancel(dev, &fap->watchdog,
@@ -772,6 +1141,7 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 	debugfs_create_file("iudma", 0400, fap->debugfs, fap, &iudma_fops);
 	debugfs_create_file("ddr", 0400, fap->debugfs, fap, &ddr_fops);
 	debugfs_create_file("peek", 0600, fap->debugfs, fap, &peek_fops);
+	debugfs_create_file("rxtest", 0600, fap->debugfs, fap, &rxtest_fops);
 	debugfs_create_file("hostbench", 0400, fap->debugfs, fap,
 			    &hostbench_fops);
 	if (fap->qsm)
@@ -780,6 +1150,11 @@ static int bcm6362_fap_probe(struct platform_device *pdev)
 		debugfs_create_file("psm", 0400, fap->debugfs, fap, &psm_fops);
 	ret = devm_add_action_or_reset(dev, bcm6362_fap_debugfs_remove,
 				       fap->debugfs);
+	if (ret)
+		return ret;
+
+	/* released after the halt below, once the 4KE writes nothing */
+	ret = devm_add_action_or_reset(dev, bcm6362_fap_rx_release, fap);
 	if (ret)
 		return ret;
 
