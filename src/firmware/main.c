@@ -132,14 +132,27 @@ static void log_reg(const char *name, unsigned int val)
 	log_putc('\n');
 }
 
+static unsigned int irq_save(void)
+{
+	unsigned int status;
+
+	__asm__ volatile("di %0\n\tehb" : "=r" (status) : : "memory");
+
+	return status;
+}
+
+static void irq_restore(unsigned int status)
+{
+	if (status & ST0_IE)
+		__asm__ volatile("ei\n\tehb" : : : "memory");
+}
+
 /* the host clears FAP_GP_MBOX_IN once it has read the previous message */
 /* also used by the main loop, so interrupts are off while it runs */
 static void mbox_send(unsigned int type, unsigned int val)
 {
 	unsigned int start = read_c0(CP0_COUNT, 0);
-	unsigned int status;
-
-	__asm__ volatile("di %0\n\tehb" : "=r" (status) : : "memory");
+	unsigned int status = irq_save();
 
 	while (reg_rd(FAP_REG_GP_STATUS) & FAP_GP_MBOX_IN) {
 		if (read_c0(CP0_COUNT, 0) - start > MBOX_ACK_TIMEOUT) {
@@ -152,19 +165,7 @@ static void mbox_send(unsigned int type, unsigned int val)
 	__asm__ volatile("sync" ::: "memory");
 	reg_wr(FAP_REG_MBOX_IN, FAP_MSG(type, val));
 
-	if (status & ST0_IE)
-		__asm__ volatile("ei\n\tehb" : : : "memory");
-}
-
-/*
- * A receive doorbell: the host reads what it needs from the ring, so this
- * carries no value and must not block. irq_armed already limits it to one
- * outstanding notification, so there is nothing to wait for.
- */
-static void mbox_notify(void)
-{
-	__asm__ volatile("sync" ::: "memory");
-	reg_wr(FAP_REG_MBOX_IN, FAP_MSG(FAP_MSG_RX, 0));
+	irq_restore(status);
 }
 
 static void mbox_pong(unsigned int cmd)
@@ -415,12 +416,9 @@ static void rx_stop(void)
 #define RX_BATCH	16
 
 /* fills free buffers, as the iuDMA will, and hands them to the host */
-static void rx_step(void)
+static void rx_fill(void)
 {
 	unsigned int n, i, t0;
-
-	if (rx.period && (int)(read_c0(CP0_COUNT, 0) - rx.next) < 0)
-		return;
 
 	t0 = read_c0(CP0_COUNT, 0);
 	for (n = 0; n < RX_BATCH; n++) {
@@ -456,16 +454,42 @@ static void rx_step(void)
 		rx.comp_prod++;
 	}
 
-	if (!n)
-		return;
+	if (n) {
+		rx.busy += read_c0(CP0_COUNT, 0) - t0;
+		rx_publish();
+	}
+}
 
-	rx.busy += read_c0(CP0_COUNT, 0) - t0;
-	rx_publish();
-	if (rxq->irq_armed) {
+/*
+ * The receive doorbell carries no value, the host reads the ring. It goes
+ * out only while the mailbox is free, so that it never overwrites a message
+ * the host has not taken yet, such as a pong, and rx_step() tries again on
+ * its next pass. Interrupts are off so that a pong cannot slip in between
+ * the check and the write; irq_armed is cleared before the message, since
+ * the host arms it again once it has drained the ring.
+ */
+static void rx_notify(void)
+{
+	unsigned int status = irq_save();
+
+	if (!(reg_rd(FAP_REG_GP_STATUS) & FAP_GP_MBOX_IN)) {
 		rxq->irq_armed = 0;
 		shared->rx.notifies++;
-		mbox_notify();
+		__asm__ volatile("sync" ::: "memory");
+		reg_wr(FAP_REG_MBOX_IN, FAP_MSG(FAP_MSG_RX, 0));
 	}
+
+	irq_restore(status);
+}
+
+static void rx_step(void)
+{
+	if (!rx.period || (int)(read_c0(CP0_COUNT, 0) - rx.next) >= 0)
+		rx_fill();
+
+	/* the host waits for a doorbell and has entries it has not seen */
+	if (rxq->irq_armed && rxq->comp_cons != rx.comp_prod)
+		rx_notify();
 }
 
 /*
