@@ -115,7 +115,11 @@
  */
 #define FAP_TX_DESC_PSM_OFFSET	0x100	/* past the receive rings */
 
-/* iuDMA descriptor, big-endian: status in the high half, length in the low */
+/* ENETSW iuDMA controller_cfg */
+#define DMA_MASTER_EN		0x1
+
+/* iuDMA descriptor, big-endian: length in the high half, status in the low */
+#define DMA_LEN_SHIFT		16
 #define DMA_OWN			0x8000
 #define DMA_EOP			0x4000
 #define DMA_SOP			0x2000
@@ -198,9 +202,11 @@ struct fap_shared {
 		unsigned int len;
 		unsigned int append;		/* DMA_APPEND_* flags */
 		/* written by the 4KE */
+		unsigned int controller_cfg;	/* sent only with DMA_MASTER_EN */
 		unsigned int kick_ticks;	/* CP0 Count to start the engine */
 		unsigned int done_ticks;	/* until OWN cleared, 0 if stuck */
 		unsigned int status;		/* descriptor status read back */
+		unsigned int irq_status;	/* channel interrupt status, then cleared */
 	} tx;
 
 	char log[FAP_LOG_SIZE];

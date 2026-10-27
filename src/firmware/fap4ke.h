@@ -27,7 +27,11 @@
 #define  IUDMA_EN		0x1
 #define  IUDMA_PKTHALT		0x2
 #define  IUDMA_BURSTHALT	0x4
-#define IUDMA_SRAM_DESC_LO	0x8	/* DmaStateRam: ring base */
+#define IUDMA_CH_INTSTAT	0x4	/* write one to clear */
+#define IUDMA_CH_MAXBURST	0xc
+#define  IUDMA_MAXBURST		8	/* 64-bit words, as the SDK and enetsw */
+#define IUDMA_SRAM_RSTART	0x0	/* DmaStateRam: ring start */
+#define IUDMA_SRAM_WORDS	4	/* ring start, then the engine state */
 
 /* internal switch, CPU port queue to iuDMA channel map */
 #define ENETSW_SWITCH		0x10e00000

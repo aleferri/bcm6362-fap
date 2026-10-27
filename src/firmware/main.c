@@ -10,6 +10,13 @@
 /* CP0 Count ticks the 4KE waits for the host to take a message */
 #define MBOX_ACK_TIMEOUT	(10 * FAP_TIMER_PERIOD)
 
+/*
+ * CP0 Count ticks the 4KE waits for the iuDMA to take a frame. With the
+ * mailbox wait it stays well within the host ping timeout, so the host
+ * never frees a frame the engine may still read.
+ */
+#define TX_DONE_TIMEOUT		(10 * FAP_TIMER_PERIOD)
+
 #define __stringify_1(x)	#x
 #define __stringify(x)		__stringify_1(x)
 
@@ -55,7 +62,7 @@ static unsigned int main_loops_seen __attribute__((section(".dspram")));
 
 /* in PSM, the single descriptor of the transmit test */
 struct iudma_desc {
-	unsigned int status_len;	/* status in the high half */
+	unsigned int len_status;
 	unsigned int addr;
 };
 
@@ -462,9 +469,9 @@ static void rx_step(void)
 }
 
 /*
- * Drives one iuDMA TX channel the host does not use. A frame indexed to
- * the router's own MAC comes back through the switch, so the host sees it
- * arrive; here we only check the engine took the descriptor.
+ * Drives one iuDMA TX channel the host does not use, set up as the enetsw
+ * driver sets up its own, with a single descriptor in PSM. The host built
+ * the frame; here we only check the engine took the descriptor.
  */
 static void tx_test(void)
 {
@@ -473,18 +480,32 @@ static void tx_test(void)
 		(FAP_4KE_PSM + FAP_TX_DESC_PSM_OFFSET);
 	unsigned int ch = shared->tx.channel;
 	volatile unsigned int *cfg, *sram;
-	unsigned int start, waited;
+	unsigned int start, waited, i;
 
 	cfg = &dma[(IUDMA_CHANNELS + ch * IUDMA_CH_STRIDE) / 4];
 	sram = &dma[(IUDMA_SRAM + ch * IUDMA_CH_STRIDE) / 4];
 
+	shared->tx.kick_ticks = 0;
+	shared->tx.done_ticks = 0;
+	shared->tx.status = 0;
+	shared->tx.irq_status = 0;
+
+	/* the enetsw driver enables the controller when its interface opens */
+	shared->tx.controller_cfg = dma[0];
+	if (!(shared->tx.controller_cfg & DMA_MASTER_EN))
+		return;
+
 	desc->addr = shared->tx.buf;
-	desc->status_len = ((DMA_OWN | DMA_SOP | DMA_EOP | DMA_WRAP |
-			     shared->tx.append) << 16) | shared->tx.len;
+	desc->len_status = (shared->tx.len << DMA_LEN_SHIFT) | DMA_OWN |
+			   DMA_SOP | DMA_EOP | DMA_WRAP | shared->tx.append;
+
+	sram[IUDMA_SRAM_RSTART / 4] = FAP_PSM_HOST_BASE + FAP_TX_DESC_PSM_OFFSET;
+	for (i = 1; i < IUDMA_SRAM_WORDS; i++)
+		sram[i] = 0;
+	cfg[IUDMA_CH_MAXBURST / 4] = IUDMA_MAXBURST;
+	cfg[IUDMA_CH_INTSTAT / 4] = cfg[IUDMA_CH_INTSTAT / 4];
 	__asm__ volatile("sync" ::: "memory");
 
-	/* point the channel at the descriptor in PSM and start it */
-	sram[IUDMA_SRAM_DESC_LO / 4] = FAP_PSM_HOST_BASE + FAP_TX_DESC_PSM_OFFSET;
 	start = read_c0(CP0_COUNT, 0);
 	cfg[IUDMA_CH_FLOWCTL / 4] = IUDMA_EN;
 	shared->tx.kick_ticks = read_c0(CP0_COUNT, 0) - start;
@@ -492,14 +513,25 @@ static void tx_test(void)
 	start = read_c0(CP0_COUNT, 0);
 	do {
 		waited = read_c0(CP0_COUNT, 0) - start;
-		if (waited > 100 * FAP_TIMER_PERIOD) {
-			shared->tx.done_ticks = 0;
-			goto out;
-		}
-	} while (desc->status_len & (DMA_OWN << 16));
-	shared->tx.done_ticks = waited;
-out:
-	shared->tx.status = desc->status_len >> 16;
+		if (waited > TX_DONE_TIMEOUT)
+			break;
+	} while (desc->len_status & DMA_OWN);
+
+	if (desc->len_status & DMA_OWN) {
+		/* stop the channel and take the descriptor back */
+		cfg[IUDMA_CH_FLOWCTL / 4] = 0;
+		start = read_c0(CP0_COUNT, 0);
+		while ((cfg[IUDMA_CH_FLOWCTL / 4] & IUDMA_EN) &&
+		       read_c0(CP0_COUNT, 0) - start <= TX_DONE_TIMEOUT)
+			;
+		desc->len_status &= ~DMA_OWN;
+	} else {
+		shared->tx.done_ticks = waited;
+	}
+
+	shared->tx.status = desc->len_status & 0xffff;
+	shared->tx.irq_status = cfg[IUDMA_CH_INTSTAT / 4];
+	cfg[IUDMA_CH_INTSTAT / 4] = shared->tx.irq_status;
 }
 
 static void run_command(unsigned int cmd)
