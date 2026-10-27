@@ -631,14 +631,14 @@ static u32 bcm6362_fap_rx_entry(struct bcm6362_fap *fap)
 	dma_addr_t dma = fap->rx.comp_dma + slot * 4;
 	u32 entry;
 
-	dma_sync_single_for_cpu(fap->dev, dma, 4, DMA_FROM_DEVICE);
+	dma_sync_single_for_cpu(fap->dev, dma, 4, DMA_BIDIRECTIONAL);
 	entry = READ_ONCE(fap->rx.comp[slot]);
 	/*
 	 * The 4KE keeps writing this line, and on most non-coherent MIPS the
 	 * sync above does nothing: drop the line again so that the next
 	 * read reaches memory.
 	 */
-	dma_sync_single_for_device(fap->dev, dma, 4, DMA_FROM_DEVICE);
+	dma_sync_single_for_device(fap->dev, dma, 4, DMA_BIDIRECTIONAL);
 
 	return entry;
 }
@@ -763,7 +763,7 @@ static void bcm6362_fap_rx_free(struct bcm6362_fap *fap)
 	if (fap->rx.comp)
 		dma_free_noncoherent(fap->dev, FAP_RX_COMP_ENTRIES * 4,
 				     fap->rx.comp, fap->rx.comp_dma,
-				     DMA_FROM_DEVICE);
+				     DMA_BIDIRECTIONAL);
 	if (fap->rx.pool)
 		dma_free_noncoherent(fap->dev,
 				     FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
@@ -819,10 +819,11 @@ static int bcm6362_fap_rx_start(struct bcm6362_fap *fap, u32 rate)
 					     FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
 					     &fap->rx.pool_dma,
 					     DMA_FROM_DEVICE, GFP_KERNEL);
+	/* bidirectional: the host zeroes it, the 4KE fills it */
 	fap->rx.comp = dma_alloc_noncoherent(fap->dev,
 					     FAP_RX_COMP_ENTRIES * 4,
 					     &fap->rx.comp_dma,
-					     DMA_FROM_DEVICE, GFP_KERNEL);
+					     DMA_BIDIRECTIONAL, GFP_KERNEL);
 	if (!fap->rx.pool || !fap->rx.comp) {
 		ret = -ENOMEM;
 		goto err_free;
@@ -838,10 +839,13 @@ static int bcm6362_fap_rx_start(struct bcm6362_fap *fap, u32 rate)
 	if (ret)
 		goto err_free;
 
-	/* no dirty line of ours may land over what the 4KE writes */
+	/*
+	 * The zeroed ring, every phase bit clear, has to reach memory, and no
+	 * dirty line of ours may stay to land over what the 4KE writes.
+	 */
 	memset(fap->rx.comp, 0, FAP_RX_COMP_ENTRIES * 4);
 	dma_sync_single_for_device(fap->dev, fap->rx.comp_dma,
-				   FAP_RX_COMP_ENTRIES * 4, DMA_FROM_DEVICE);
+				   FAP_RX_COMP_ENTRIES * 4, DMA_BIDIRECTIONAL);
 	dma_sync_single_for_device(fap->dev, fap->rx.pool_dma,
 				   FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE,
 				   DMA_FROM_DEVICE);
