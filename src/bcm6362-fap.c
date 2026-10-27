@@ -148,6 +148,8 @@ struct bcm6362_fap {
 		u64 errors;
 		u64 gaps;
 		u64 bad;
+		u32 bad_entry;		/* the first bad one */
+		u32 bad_at;
 		u64 busy_ns;
 		ktime_t start;
 		ktime_t stop;
@@ -659,7 +661,10 @@ static void bcm6362_fap_rx_frame(struct bcm6362_fap *fap, u32 entry)
 
 	if (off >= FAP_RX_POOL_BUFS * FAP_RX_BUF_SIZE ||
 	    (entry & FAP_RX_COMP_LEN) != FAP_RX_TEST_LEN) {
-		fap->rx.bad++;
+		if (!fap->rx.bad++) {
+			fap->rx.bad_entry = entry;
+			fap->rx.bad_at = fap->rx.comp_cons;
+		}
 		return;
 	}
 
@@ -927,6 +932,10 @@ static int rxtest_show(struct seq_file *s, void *unused)
 		   fap->rx.frames, fap->rx.errors, fap->rx.gaps, fap->rx.bad);
 	seq_printf(s, "        %llu frames/s, cpu %llu.%02llu%%\n", rate,
 		   busy / 100, busy % 100);
+	if (fap->rx.bad)
+		seq_printf(s, "        first bad 0x%08x at %u, pool 0x%08llx\n",
+			   fap->rx.bad_entry, fap->rx.bad_at,
+			   (u64)fap->rx.pool_dma);
 	seq_printf(s, "4ke     frames %u notifies %u idle free %u ring %u\n",
 		   READ_ONCE(frx->frames), READ_ONCE(frx->notifies),
 		   READ_ONCE(frx->idle_free), READ_ONCE(frx->idle_ring));
