@@ -715,19 +715,20 @@ static void bcm6362_fap_rx_work(struct work_struct *work)
 					       rx.work);
 	ktime_t start = ktime_get();
 
-	do {
-		/* counted before yielding, the work may never end under load */
-		while (bcm6362_fap_rx_poll(fap, FAP_RX_BUDGET) == FAP_RX_BUDGET) {
-			fap->rx.busy_ns += ktime_to_ns(ktime_sub(ktime_get(),
-								 start));
-			cond_resched();
-			start = ktime_get();
+	for (;;) {
+		if (bcm6362_fap_rx_poll(fap, FAP_RX_BUDGET) < FAP_RX_BUDGET) {
+			fap_rxq_wr(fap, FAP_RXQ(irq_armed), 1);
+			/* armed before looking again, or a notification is missed */
+			mb();
+			if (!bcm6362_fap_rx_ready(fap, bcm6362_fap_rx_entry(fap)))
+				break;
 		}
 
-		fap_rxq_wr(fap, FAP_RXQ(irq_armed), 1);
-		/* armed before looking again, or a notification is missed */
-		mb();
-	} while (bcm6362_fap_rx_ready(fap, bcm6362_fap_rx_entry(fap)));
+		/* counted before yielding, the work may never end under load */
+		fap->rx.busy_ns += ktime_to_ns(ktime_sub(ktime_get(), start));
+		cond_resched();
+		start = ktime_get();
+	}
 
 	fap->rx.busy_ns += ktime_to_ns(ktime_sub(ktime_get(), start));
 }
